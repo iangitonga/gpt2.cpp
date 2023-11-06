@@ -53,7 +53,7 @@ def _download_model(url, model_path):
 
 def download_model(model_name, dtype):
     if dtype == "qint8":
-        model_path = os.path.join("models", f"{model_name}.qint8.gten")
+        model_path = os.path.join("models", f"{model_name}.q8.gten")
     else:
         model_path = os.path.join("models", f"{model_name}.fp16.gten")
     if os.path.exists(model_path):

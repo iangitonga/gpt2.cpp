@@ -38,6 +38,26 @@ Examples:
 // max_ctx
 // set n_threads.
 
+/*
+
+[performance]: single-thread
+sm:  43ms
+md: 116ms x2.7
+lg: 250ms x2.2
+lgq:
+xl: 573ms x2.2
+xlq:
+
+[performance]: multithreaded
+sm:  57ms x1.3
+md: 132ms x1.1
+lg: 246ms x0.98
+xl: 526ms x0.91
+
+Either cpu oversaturation or no-improvements.
+
+*/
+
 int main(int argc, char const *argv[])
 {
     if (argc < 2) {
