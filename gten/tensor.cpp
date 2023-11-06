@@ -1,192 +1,304 @@
-#include "tensor.h"
-
-#include <cmath>
-#include <cstring>
 #include <iostream>
 #include <iomanip>
 
+#include "tensor.h"
 
 
 namespace gten {
 
-Tensor::Tensor(std::initializer_list<int> shape, Dtype dtype)
+/*
+
+Types of tensors:
+- Weight tensor:
+  ~ Allocate -> fill. Always static. 
+- Activation tensor:
+  ~ Allocate max size required for inference.
+  ~ initial numel=0, shape=()
+  ~ compute; update [numel, shape, strides]
+  ~ compute with offsets.
+*/
+
+
+Tensor::Tensor(const std::vector<int>& shape, TensorDtype dtype, float qscale, int qzerop)
+    : dtype_{dtype}, qscale_{qscale}, qzerop_{qzerop}
 {
-    set_shape(shape);
-    dtype_ = dtype;
-    ndims_ = shape.size();
-    numel_ = numel_from_shape();
-    storage_capacity_ = nbytes();
-    data_ = std::shared_ptr<uint8_t[]>(new uint8_t[storage_capacity_]);
+    validate_shape(shape);
+    // if (dtype == kQint8) {
+    //     GTEN_ASSERT(qscale != 0, "Expected non-zero scale for dtype Qint8 but got %d.", qscale);
+    // }
+    const int numel = numel_from_shape(shape);
+    const int alloc_bytes = numel * itemsize();
+
+    data_ptr_ = std::shared_ptr<uint8_t[]>(new uint8_t[alloc_bytes]);
+    storage_size_ = alloc_bytes;
+    G_TensorMemAllocated += alloc_bytes;
+    numel_ = numel;
+    shape_ = shape;
+    set_strides_from_shape(shape);
 }
+
 
 // An empty deleter allows us to use external data storage that we do not own.
 static void empty_deleter(uint8_t* ptr) {  }
 
-Tensor::Tensor(void* data_ptr, std::initializer_list<int> shape, Dtype dtype)
+Tensor::Tensor(void* data_ptr, const std::vector<int>& shape, TensorDtype dtype, float qscale, int qzerop)
+    : dtype_{dtype}, qscale_{qscale}, qzerop_{qzerop}
 {
+    // if (dtype == kQint8) {
+    //     GTEN_ASSERT(qscale != 0, "Expected non-zero scale for dtype Qint8 but got %d.", qscale);
+    // }
     GTEN_ASSERT(data_ptr != nullptr, "Expected a non-null pointer but got a nullptr.");
     uint8_t* real_ptr = static_cast<uint8_t*>(data_ptr);
     // An empty deleter ensures we do not delete the data since we do not own it.
-    data_ = std::shared_ptr<uint8_t[]>(real_ptr, empty_deleter);
-    set_shape(shape);
-    dtype_ = dtype;
-    ndims_ = shape.size();
-    numel_ = numel_from_shape();
-    storage_capacity_ = 0;
+    data_ptr_ = std::shared_ptr<uint8_t[]>(real_ptr, empty_deleter);
+    validate_shape(shape);
+    shape_ = shape;
+    set_strides_from_shape(shape);
+    numel_ = numel_from_shape(shape);
+    storage_size_ = 0;
 }
 
-void Tensor::set_shape(std::initializer_list<int> shape) {
-    const int ndims = shape.size();
-    GTEN_ASSERT(
-        ndims > 1 || ndims < 3,
-        "Expected tensor shape to have ndims=(1, 2 or 3) but got ndims=%d instead.",
-        ndims);
 
-    for (int i = 0; i < ndims; i++)
-    {
-        int size_i = *(shape.begin() + i);
-        shape_[i] = size_i;
-        GTEN_ASSERT(size_i != 0, "The size of dim %d of the given shape is zero.", i);
+void Tensor::validate_shape(const std::vector<int>& shape) const {
+    GTEN_ASSERT(shape.size() != 0, "The given shape is empty.");
+    GTEN_ASSERT(shape.size() <= 3, "Shape with dimensions > 3 not supported.");
+    for (int i = 0; i < int(shape.size()); i++) {
+        if (shape[i] <= 0) {
+            std::cerr << "err\n";
+            GTEN_ASSERT(false, "The value of dimension %d: %d of the given shape is invalid!", i, shape[i]);
+        }
     }
 }
 
-void Tensor::resize(std::initializer_list<int> shape) noexcept
-{
-    set_shape(shape);
-    ndims_ = shape.size();
-    numel_ = numel_from_shape();
-    GTEN_ASSERT(
-        nbytes() <= storage_capacity_,
-        "Resize size: %ld, exceeds preallocated size: %ld.",
-        nbytes(),
-        storage_capacity_);
-}
 
-int32_t Tensor::numel_from_shape() const noexcept {
-    int32_t numel = 1;
-    for (int i = 0; i < ndims_; i++)
-       numel *= shape_[i];
+int Tensor::numel_from_shape(const std::vector<int>& shape) const {
+    int numel = 1;
+    for (int size : shape) {
+        numel = numel * size;
+    }
     return numel;
 }
 
-int32_t Tensor::size(int32_t i) const
+// Contigous only???
+void Tensor::resize(const std::vector<int>& new_shape) {
+    validate_shape(new_shape);
+    const int new_size = numel_from_shape(new_shape) * itemsize();
+    if (new_size > storage_size_) {
+        GTEN_ASSERT(false, "The new shape provided (cap=%d) exceeds storage capacity = %d.", new_size, storage_size_);
+    }
+    shape_ = new_shape;
+    set_strides_from_shape(new_shape);
+    numel_ = numel_from_shape(new_shape);
+}
+
+
+void Tensor::set_strides_from_shape(const std::vector<int>& shape) {
+    // 1-dim: 1
+    // 2-dim: d2, 1
+    // 3-dim: d2*d3, d3, 1
+    switch (shape.size()) {
+        case 1: {
+            strides_ = {1};
+            break;
+        }
+        case 2: {
+            const int d1 = shape[1];
+            strides_ = {d1, 1};
+            break;
+        }
+        case 3: {
+            const int d1 = shape[1];
+            const int d2 = shape[2];
+            strides_ = {d1*d2, d2, 1};
+            break;
+        }
+    }
+}
+
+
+void print_vector(const std::vector<int>& vec) {
+    std::cout << "(";
+    for (int i = 0; i < int(vec.size()); i++) {
+        std::cout << vec[i];
+        if (i != int(vec.size()) - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << ")\n";
+}
+
+void Tensor::print_info() const {
+    auto data = data_ptr<void>();
+    std::cout << "\nTensor(\n"
+              << "  dtype    : " << dtype_str(dtype_) << "\n"
+              << "  shape    : ";
+    print_vector(shape_);
+    std::cout << "  strides  : ";
+    print_vector(strides_);
+    std::cout << "  numel    : " << numel_ << "\n"
+            //   << "  numel cap: " << storage_size_/itemsize() << "\n"
+              << "  capacity : " << storage_size_ << " bytes\n"
+              << "  pointer  : "   << data << "\n)\n";
+    
+}
+
+// Should we create and return a new tensor with the new shape?
+Tensor Tensor::view(const std::vector<int>& new_shape) const {
+    validate_shape(new_shape);
+    const int new_numel = numel_from_shape(new_shape);
+    const int old_numel = numel_from_shape(shape_);
+    GTEN_ASSERT(new_numel == old_numel, "New shape numel `%d` must be equal with old shape numel `%d`.", new_numel, old_numel);
+
+    Tensor out = *this;
+    out.shape_ = new_shape;
+    out.set_strides_from_shape(new_shape);
+
+    return out;
+}
+
+
+// Should we create and return a new tensor with the new shape?
+Tensor Tensor::permute(const std::vector<int> &indices)
 {
-    GTEN_ASSERT(
-        i < ndims_,
-        "Tensor dim access, %d, is out of range of a tensor with %d-dims.",
-        i,
-        ndims_);
-    return shape_[i];
+    GTEN_ASSERT(indices.size() == shape_.size(),
+                "The dims of indices `%ld` given do not match the tensor dims `%ld`.",
+                indices.size(), shape_.size());
+
+    std::vector<int> new_shape = shape_;
+    std::vector<int> new_strides = strides_;
+    for (int i = 0; i < int(indices.size()); i++) {
+        const int idx = indices[i];
+        new_shape[i] = shape_[idx];
+        new_strides[i] = strides_[idx]; 
+    }
+    shape_ = std::move(new_shape);
+    strides_ = std::move(new_strides);
+    
+    return *this;
 }
 
-bool Tensor::shape_is_equal(std::initializer_list<int> shape) const noexcept
+void Tensor::set_strides(const std::vector<int>& strides)
 {
-    if (shape.size() != static_cast<size_t>(ndims_))
-        return false;
-    for (int i = 0; i < ndims_; i++)
-        if (shape_[i] != *(shape.begin() + 1))
-            return false;
-    return true;
+    GTEN_ASSERT(strides.size() == shape_.size(), "The given strides ndims must match shape ndims.");
+    for (int i = 0; i < int(strides.size()); i++) {
+        if (strides[i] <= 0) {
+            GTEN_ASSERT(false, "The stride at index %d, `%d` is invalid.", i, strides[i]);
+        }
+    }
+    strides_ = strides;
 }
 
-void Tensor::print_info() const noexcept {
-    auto data_pointer = reinterpret_cast<void*>(data_.get());
-    std::cout << "Tensor(\n"
-              << "  dtype   : " << dtype_str(dtype_) << "\n"
-              << "  ndims   : " << ndims_ << "\n"
-              << "  shape   : (" << shape_[0] << ", " << shape_[1] << ", " << shape_[2] << ")\n"
-              << "  numel   : " << numel_ << "\n"
-              << "  capacity: " << storage_capacity_ << "\n"
-              << "  pointer : "   << data_pointer << "\n)\n";
+std::string Tensor::shape_str() const
+{
+    std::stringstream s;
+    s << "(";
+    for (int i = 0; i < int(shape_.size()); i++) {
+        s << shape_[i];
+        if (i != int(shape_.size()) - 1) {
+            s << ", ";
+        }
+    }
+    s << ")";
+    
+    return s.str();
 }
 
-void Tensor::print_single(int32_t item_idx, int32_t col_idx, int32_t n_cols) const noexcept
+std::string Tensor::strides_str() const {
+    std::stringstream s;
+    s << "(";
+    for (int i = 0; i < int(strides_.size()); i++) {
+        s << strides_[i];
+        if (i != int(strides_.size()) - 1) {
+            s << ", ";
+        }
+    }
+    s << ")";
+    
+    return s.str();
+}
+
+void Tensor::print_single(int item_idx, int col_idx, int n_cols) const
 {
     uint32_t max_cols = dtype_ == kInt32 ? 32 : 8;
-    if (dtype_ == kFloat16)
+    if (dtype_ == kFloat16) {
         std::cout << std::fixed
                   << std::setprecision(4)
                   << std::setw(7)
-                  << fp16_to_fp32(reinterpret_cast<Float16*>(data_.get())[item_idx]);
-    else if (dtype_ == kFloat32)
+                  << fp16_to_fp32(data_ptr<Float16>()[item_idx]);
+    }
+    else if (dtype_ == kFloat32) {
         std::cout << std::fixed
                   << std::setprecision(4)
                   << std::setw(7)
-                  << reinterpret_cast<Float32*>(data_.get())[item_idx];
-    else
-        std::cout << reinterpret_cast<Int32*>(data_.get())[item_idx];
-    if (col_idx != n_cols - 1)
+                  << data_ptr<float>()[item_idx];
+    }
+    else {
+        std::cout << std::setw(2) << data_ptr<int>()[item_idx];
+    }
+    if (col_idx != n_cols - 1) {
         std::cout << ", ";
-    if (col_idx > 0 && (col_idx % max_cols) == 0)
+    }
+    if (col_idx > 0 && (col_idx % max_cols) == 0) {
         std::cout << "\n  ";
+    }
 }
 
-void Tensor::print() const noexcept
+void Tensor::print() const
 {
-    std::cout << "Tensor(\n";
-
-    if (dtype_ == kFloat16)
-        std::cout << "Numel=" << numel_ << "\nDtype=Float16\n[";
-    else if (dtype_ == kFloat32)
-        std::cout << "Numel=" << numel_ << "\nDtype=Float32\n[";
-    else
-        std::cout << "Numel=" << numel_ << "\nDtype=Int32\n[";
-
-    if (ndims_ == 1)
-    {
+    std::cout << "\n[";
+    const int ndims = shape_.size();
+    if (ndims == 1) {
         for (int col = 0; col < numel_; col += 1)
             print_single(col, col, numel_);
     }
-    else if (ndims_ == 2)
-    {
-        const int n_rows = shape_[0];
-        const int n_cols = shape_[1];
-        for (int row = 0; row < n_rows; row++)
-        {
+    else if (ndims == 2) {
+        const int rows = shape_[0];
+        const int cols = shape_[1];
+        const int st0 = strides_[0];
+        const int st1 = strides_[1];
+        for (int row = 0; row < rows; row++) {
             if (row == 0) std::cout << "[";
             else std::cout << " [";
-            for (int col = 0; col < n_cols; col++)
-            {
-                const int idx = row * shape_[1] + col;
-                if (idx >= numel_)
-                    break;
-                print_single(idx, col, n_cols);
+            for (int col = 0; col < cols; col++) {
+                const int idx = row * st0 + col * st1;
+                print_single(idx, col, cols);
             }
-            if (row != n_rows - 1) std::cout << "]\n";
+            if (row != rows - 1) std::cout << "]\n";
             else std::cout << "]";
         }
     }
     else // ndims=3
     {
-        const int n_depth = shape_[0];
-        const int n_rows = shape_[1];
-        const int n_cols = shape_[2];
-        for (int depth = 0; depth < n_depth; depth++)
+        const int chs = shape_[0];
+        const int rows = shape_[1];
+        const int cols = shape_[2];
+        const int st0 = strides_[0];
+        const int st1 = strides_[1];
+        const int st2 = strides_[2];
+
+        for (int ch = 0; ch < chs; ch++)
         {
-            if (depth == 0) std::cout << "[";
+            if (ch == 0) std::cout << "[";
             else std::cout << " [";
-            for (int row = 0; row < n_rows; row++)
-            {
+            for (int row = 0; row < rows; row++) {
                 if (row == 0) std::cout << "[";
                 else std::cout << "  [";
-                for (int col = 0; col < n_cols; col++)
-                {
-                    const int idx = (depth * shape_[1] * shape_[2]) + (row * shape_[1]) + col;
-                    if (idx >= numel_)
-                        break;
-                    print_single(idx, col, n_cols);
+                for (int col = 0; col < cols; col++) {
+                    const int idx = ch * st0 + row * st1 + col * st2;
+                    print_single(idx, col, cols);
                 }
                 std::cout << "]";
-                if (row != n_rows - 1)
+                if (row != rows - 1)
                     std::cout << "\n";
             }
             std::cout << "]";
-            if (depth != n_depth - 1)
+            if (ch != chs - 1)
                 std::cout << "\n\n";
         }
         
     }
-    std::cout << "])\n";
+
+    std::cout << "]\n\n";
 }
 
 std::ostream& operator<<(std::ostream& stream, const Tensor& tensor) {
@@ -194,4 +306,4 @@ std::ostream& operator<<(std::ostream& stream, const Tensor& tensor) {
     return stream;
 }
 
-} // namespace gten
+} // namespace gten.

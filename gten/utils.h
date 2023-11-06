@@ -7,6 +7,10 @@
 
 #include "gten_types.h"
 
+
+#define GTEN_SIMD_VEC_SIZE 8
+
+
 // TODO: Allow AVX without F16C for FP32 mode.
 #if defined(__AVX__) && defined(__F16C__)
 #define GTEN_SIMD 1
@@ -75,7 +79,7 @@ inline Vec_f32x8 vec_f32x8_setzero() {
 // FLOATING PONT SCALAR OPERATIONS
 
 struct Vec_f32x8 {
-    Float32 a[8];
+    Float32 a[GTEN_SIMD_VEC_SIZE];
 };
 
 static Float32* init_cache() {
@@ -120,7 +124,7 @@ inline Vec_f32x8 vec_f32x8_load(const Float32* src_ptr) {
 }
 
 inline void vec_f32x8_store(Vec_f32x8 v, Float16* dest_ptr) {
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < GTEN_SIMD_VEC_SIZE; i++) {
         dest_ptr[i] = fp32_to_fp16(v.a[i]);
     }
 }
@@ -214,7 +218,7 @@ inline Float32 fpcvt_to_fp32(input_t value) noexcept {
         return fp16_to_fp32(value);
     }
     else {
-        GTEN_ASSERT(false, "Conversion to FP32 is only allowed for FP32 and FP16 types.");
+        // GTEN_ASSERT(false, "Conversion to FP32 is only allowed for FP32 and FP16 types.");
         // Just to avoid "no return statement in function returning non-void" error in
         // case we instantiate using a disallowed type.
         return 0;
@@ -233,9 +237,20 @@ inline output_t fpcvt_from_fp32(Float32 value) noexcept {
         return fp32_to_fp16(value);
     }
     else {
-        GTEN_ASSERT(false, "Conversion from FP32 is only allowed for FP32 and FP16 types.");
+        // GTEN_ASSERT(false, "Conversion from FP32 is only allowed for FP32 and FP16 types.");
         return 0;
     }
+}
+
+// Convert IEEE 16-bit float (half precision) to 32-bit float (single precision).
+inline float fpcvt_htos(Float16 scalar) {
+    return fp16_to_fp32(scalar);
+}
+
+
+// Convert 32-bit float (single precision) to IEEE 16-bit float (half precision).
+inline Float16 fpcvt_stoh(float scalar) {
+    return fp32_to_fp16(scalar);
 }
 
 } // namespace gten

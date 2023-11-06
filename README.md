@@ -1,6 +1,7 @@
 # gpt2.cpp
 **gpt2.cpp** is a simple, minimal, pure-C++ implementation of GPT-2 inference on CPU. It runs GPT2
-model inference on FP16 mode and utilizes AVX on Intel chips.
+model inference on FP16 mode and experimental quantized int8 inference for large and xl models.
+AVX SIMD utilities for Intel chips are also implemented.
 
 
 ## Install and Run GPT-2.
@@ -14,4 +15,19 @@ If you have an Intel CPU that supports AVX and f16c compile with the following
  command to achieve ~4x performance:
  
 g++ -std=c++17 -O3 -ffast-math -mavx -mf16c gpt2.cpp -o gpt2
+./gpt2 -p "Once upon a time"
+
+Multithreading support via OpenMP is also implemented to accelerate linear layers.
+ To allow inference with multithreading, compile with:
+
+g++ -std=c++17 -O3 -fopenmp -ffast-math gpt2.cpp -o gpt2
+
+OR
+
+g++ -std=c++17 -O3 -ffast-math -fopenmp -mavx -mf16c gpt2.cpp -o gpt2
+
+for Intel.
+
+Run ./gpt2 --help to see all available options.
+
 ```

@@ -3,31 +3,39 @@
 #include <cmath>
 #include <cstdint>
 
-namespace gten
-{
+namespace gten {
+
 
 // SCALAR DATA TYPES.
 typedef int32_t Int32;
 typedef uint16_t Float16;
 typedef float Float32;
+typedef int8_t Qint8;
 
-// Allows data type information to be stored and passed around as variables because we
-// cannot do that with the types themselves.
-enum class Dtype { Int32, Float16, Float32 };
+enum class TensorDtype {
+    Int32,
+    Float32,
+    Float16,
+    Qint8
+};
 
 // Convenient shorthands for the enum class above.
-static Dtype kInt32 = Dtype::Int32;
-static Dtype kFloat16 = Dtype::Float16;
-static Dtype kFloat32 = Dtype::Float32;
+static const TensorDtype kInt32 = TensorDtype::Int32;
+static const TensorDtype kFloat16 = TensorDtype::Float16;
+static const TensorDtype kFloat32 = TensorDtype::Float32;
+static const TensorDtype kQint8 = TensorDtype::Qint8;
 
-// Convert Dtype to a str for error reporting.
-static const char* dtype_str(Dtype dtype) {
-    if (dtype == Dtype::Int32)
+
+static const char* dtype_str(TensorDtype dtype) {
+    if (dtype == kInt32) {
         return "Int32";
-    else if (dtype == Dtype::Float16)
+    } else if(dtype == kQint8) {
+        return "Qint8";
+    } else if (dtype == kFloat16) {
         return "Float16";
-    else
+    } else {
         return "Float32";
+    }
 }
 
 
@@ -70,9 +78,6 @@ inline Float32 fp16_to_fp32(Float16 h) noexcept
     return fp32_from_bits(result);
 }
 
-// MAX:  65504.0 (0)[11110]{1111111111}
-// MIN: -65504.0 (1)[11110]{1111111111}
-
 inline Float16 fp32_to_fp16(Float32 f) noexcept
 {
     const float scale_to_inf = fp32_from_bits(UINT32_C(0x77800000));
@@ -95,15 +100,4 @@ inline Float16 fp32_to_fp16(Float32 f) noexcept
     return (sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign);
 }
 
-} // namespace gten
-
-// Assert that the given boolean is true. If false, print message and terminate program.
-// TODO: Replace with C++ 20 __VA_OPT__, __VA_ARGS__ may not work on non-gcc compilers.
-#define GTEN_ASSERT(boolean, message, ...)                                              \
-    if (!(boolean)) {                                                                   \
-        std::fprintf(stderr, "\x1B[1;31m");                                             \
-        std::fprintf(stderr, "GTEN ERROR [File `%s` line %d]: ", __FILE__, __LINE__);   \
-        std::fprintf(stderr, message, ##__VA_ARGS__);                                   \
-        std::fprintf(stderr, "\n");                                                     \
-        std::exit(EXIT_FAILURE);                                                        \
-    } 
+} // namespace gten.

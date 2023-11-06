@@ -1,7 +1,5 @@
 import argparse
-import array
 import math
-import os
 import urllib
 from dataclasses import dataclass
 
@@ -117,53 +115,107 @@ class Transformer(nn.Module):
 GTEN_MAGIC_NUMBER = 0x454c49464e455447
 BYTEORDER = "little"
 
-
-def itob(integer, width=4):
+# unsigned int to bytes.
+def uitob(integer, width=4):
     return int.to_bytes(integer, width, BYTEORDER)
 
-def btoi(bytes_):
-    return int.from_bytes(bytes_, BYTEORDER)
+# signed int to bytes
+def intob(integer, width=4):
+    assert width in (1, 2, 4, 8)
+    width_map = {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}
+    return np.array([integer]).astype(width_map[width]).tobytes()
 
+# float to bytes
+def ftob(floatv):
+    return np.array([floatv]).astype(np.float32).tobytes()
+
+"""
+
+1. qint8 has scale and zerop while f16 doesnt
+    - detect.
+    - implement read_tensor for [fp16, qint8]
+    - A: No change to current models. Imp for experimentation.
+    - 
+
+"""
+
+def scale(alpha, beta, alpha_q=-128, beta_q=127):
+    return (beta - alpha) / (beta_q - alpha_q)
+
+
+def zero_point(alpha, beta, alpha_q=-128, beta_q=127):
+    zerop = np.round((beta*alpha_q - alpha*beta_q) / (beta - alpha))
+    zerop = int(zerop)
+    return zerop
+
+
+def quantize(t):
+    alpha_q, beta_q = -128, 127
+    alpha, beta = t.min(), t.max()
+    s = scale(alpha, beta, alpha_q, beta_q)
+    z = zero_point(alpha, beta, alpha_q, beta_q)
+    t = np.round(1 / s * t + z).astype(np.int8)
+    return s, z, t
+
+def dequantize(t, s, z):
+    t = (t - z).astype(torch.float32) * s
+    return t
 
 
 def write_layer(fout, name, weights_size, w0, bias):
     name = name.encode()
     # <layer_name_size, layer_name>
-    fout.write(itob(len(name)))
+    fout.write(uitob(len(name)))
     fout.write(name)
 
     # W0
     if w0 is not None:
         w0_name = f"{name.decode()}.weight".encode()
-        fout.write(itob(len(w0_name)))
+        fout.write(uitob(len(w0_name)))
         fout.write(w0_name)
 
         w0 = w0.detach().numpy().flatten()
-        w0 = w0.astype(np.float16)
 
+        if weights_size == 1:
+            scale, zerop, w0 = quantize(w0)
+
+            fout.write(ftob(scale))
+            fout.write(intob(zerop, width=4))
+        elif weights_size == 2:
+            w0 = w0.astype(np.float16)
+        else:
+            w0 = w0.astype(np.float32)
+        
         w0_bytes = w0.tobytes()
-        fout.write(itob(len(w0_bytes)))
+        fout.write(uitob(len(w0_bytes)))
         fout.write(w0_bytes)
 
     # Bias
     if bias is not None:
         # NOTE: We do not quantize biases.
         bias_name = f"{name.decode()}.bias".encode()
-        fout.write(itob(len(bias_name)))
+        fout.write(uitob(len(bias_name)))
         fout.write(bias_name)
 
         bias = bias.detach().numpy().flatten()
-        bias = bias.astype(np.float16)
+        if weights_size == 1:
+            scale, zerop, bias = quantize(bias)
+            fout.write(ftob(scale))
+            fout.write(intob(zerop, width=4))
+        elif weights_size == 2:
+            bias = bias.astype(np.float16)
+        else:
+            bias = bias.astype(np.float32)
 
         bias_bytes = bias.tobytes()
-        fout.write(itob(len(bias_bytes)))
+        fout.write(uitob(len(bias_bytes)))
         fout.write(bias_bytes)
 
 
 def write_block(fout, name, model, weights_size, block_idx):
     name = name.encode()
     # <block_name_size, block_name>
-    fout.write(itob(len(name)))
+    fout.write(uitob(len(name)))
     fout.write(name)
 
     h = model.h[block_idx]
@@ -205,16 +257,14 @@ def write_block(fout, name, model, weights_size, block_idx):
     write_layer(fout, layer_name, weights_size=weights_size, w0=ln_2w, bias=ln_2b)
     
 
-def convert_model_to_gten(model, model_name, vocab_fname, weights_size):
-    model_fname = f"{model_name}.fp16.gten"
-
+def convert_model_to_gten(model, model_fname, vocab_fname, weights_size):
     with open(model_fname, "wb") as fout:
-        fout.write(itob(GTEN_MAGIC_NUMBER, width=8))
-        fout.write(itob(model.config.n_vocab))
-        fout.write(itob(model.config.n_ctx))
-        fout.write(itob(model.config.n_state))
-        fout.write(itob(model.config.n_layer))
-        fout.write(itob(model.config.n_head))
+        fout.write(uitob(GTEN_MAGIC_NUMBER, width=8))
+        fout.write(uitob(model.config.n_vocab))
+        fout.write(uitob(model.config.n_ctx))
+        fout.write(uitob(model.config.n_state))
+        fout.write(uitob(model.config.n_layer))
+        fout.write(uitob(model.config.n_head))
         
         print("Writing vocab")
         segment_name = b"vocab"
@@ -224,9 +274,9 @@ def convert_model_to_gten(model, model_name, vocab_fname, weights_size):
             vocab_bytes = vf.read()
             segment_size = len(vocab_bytes)
             assert segment_size == expected_size, f"Vocab: expected={expected_size}, real={segment_size}"
-            fout.write(itob(segment_name_size))
+            fout.write(uitob(segment_name_size))
             fout.write(segment_name)
-            fout.write(itob(segment_size))
+            fout.write(uitob(segment_size))
             fout.write(vocab_bytes)
         
         print("Converting wte")
@@ -294,26 +344,41 @@ MODEL_CONFIG = {
     "Gpt2-xl":     ModelConfig(n_vocab = 50257, n_ctx = 1024, n_state = 1600, n_layer = 48, n_head = 25, n_mlp = 1600 * 4),
 }
 
+OUT_DTYPES = (
+    "f32",
+    "f16",
+    "qint8"
+)
 
-def download_and_convert(model_name, model_path, vocab_path):
-    weights_size = 2
-
-    print(F"Converting to FP16")
+def download_and_convert(model_name, out_dtype, model_path, vocab_path):
+    if out_dtype == "f32":
+        weights_size = 4
+        model_fname = f"{model_name}.f32.gten"
+        print(F"Converting to float32 format ...")
+    elif out_dtype == "f16":
+        model_fname = f"{model_name}.f16.gten"
+        weights_size = 2
+        print(F"Converting to float16 format ...")
+    elif out_dtype == "qint8":
+        model_fname = f"{model_name}.q8.gten"
+        weights_size = 1
+        print(F"Converting to Qint8 format ...")
 
     if not model_path:
         model_path = download_model(model_name, MODEL_URL[model_name])
     if not vocab_path:
         vocab_path = download_vocab(VOCAB_URL)
     model = Transformer.from_pretrained(model_path, MODEL_CONFIG[model_name])
-    convert_model_to_gten(model, model_name, vocab_path, weights_size)
+    convert_model_to_gten(model, model_fname, vocab_path, weights_size)
     print("Conversion complete!!!")
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model", help="Model name to be converted.", choices=MODEL_CONFIG.keys())
+parser.add_argument("--out_dtype", help="Output data format. default is f16.", choices=OUT_DTYPES, default="f16")
 parser.add_argument("--mpath", help="Optional path to source model if you have it locally.")
 parser.add_argument("--vpath", help="Optional path to vocab if you have it locally.")
 
 args = parser.parse_args()
 
-download_and_convert(args.model, args.mpath, args.vpath)
+download_and_convert(args.model, args.out_dtype, args.mpath, args.vpath)
