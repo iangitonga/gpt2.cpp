@@ -131,10 +131,10 @@ int main(int argc, char const *argv[])
         }
     }
 
-    // if ((options.model_name == "Gpt2" || options.model_name == "Gpt2-medium") && options.dtype == kQint8) {
-    //     std::cerr << "Model `" << options.model_name << "` does not have a quantized version. Try -lg or -xl.\n";
-    //     return -1;
-    // }
+    if ((options.model_name == "Gpt2" || options.model_name == "Gpt2-medium") && options.dtype == kQint8) {
+        std::cerr << "Model `" << options.model_name << "` does not have a quantized version. Try -lg or -xl.\n";
+        return -1;
+    }
 
     options.print_debug_info();
 
