@@ -8,10 +8,12 @@ using namespace gten;
 
 
 struct InferenceOptions {
-    std::string model_name {"Gpt2-medium"};
+    std::string model_name {"Gpt2"};
     std::string prompt {""};
-    int gen_tokens {500}; // number of tokens to generate.
+    int max_ctx {1024};
+    int n_predict {200}; // number of tokens to generate.
     float temp {0.9f};
+    int top_k {40};
     bool debug_mode {false};
     bool greedy {false};
     bool showstat {false};
@@ -42,9 +44,10 @@ struct InferenceOptions {
         if (debug_mode) {
             std::cout << "Model name     : " << model_name << "\n";
             std::cout << "Model path     : " << get_model_path() << "\n";
-            std::cout << "Inference      : " << "FP16" << "\n";
+            std::cout << "Inference      : " << dtype_str(dtype) << "\n";
             std::cout << "Temperature    : " << temp << "\n";
-            std::cout << "Tokens to gen  : " << gen_tokens << "\n";
+            std::cout << "Tokens to gen  : " << n_predict << "\n";
+            std::cout << "Top-k          : " << top_k << "\n";
         }
     }
 
@@ -54,29 +57,19 @@ struct InferenceOptions {
 
         if (num_prompt_tokens >= max_ctx_size) {
             // Prompt length is too large, quit. Technically, we can allow generation of
-            // arbitrary-length documents by selecting the last 1000 context tokens and using
-            // that to predict the next token but the modules are not yet designed with that
-            // in mind. In the future that feature will be available.
+            // arbitrary-length documents by selecting the last 1024 context tokens and using
+            // that to predict the next token but once the prompt reaches max_ctx_size, caching
+            // cannot be used and thus prediction becomes very slow.
             GTEN_ASSERT(false, "Prompt length is too large!");
         }
-        // How many tokens: gen_tokens + prompt tokens
-        int ctx_size = num_prompt_tokens + gen_tokens;
+        // How many tokens: n_predict + prompt tokens
+        int ctx_size = num_prompt_tokens + n_predict;
 
-        // Round of to the nearest power of two.
-        if (ctx_size < 32)
-            return 32;
-        else if (ctx_size < 64)
-            return 64;
-        else if (ctx_size < 128)
-            return 128;
-        else if (ctx_size < 256)
-            return 256;
-        else if (ctx_size < 512)
-            return 512;
-        else if (ctx_size < 768)
-            return 768;
-        else
+        if (ctx_size > max_ctx_size) {
             return max_ctx_size;
+        }
+
+        return ctx_size;
     }
 
 };
@@ -88,7 +81,7 @@ struct GPT2Config
 
     friend std::ostream& operator<<(std::ostream& stream, const GPT2Config& config)
     {
-        stream << "GPT2Config:" << '\n'
+        stream << "\nGPT2Config:" << '\n'
                << "n_vocab: " << config.n_vocab << '\n'
                << "n_ctx  : " << config.n_ctx << '\n'
                << "n_embed: " << config.n_embed << '\n'
@@ -235,29 +228,26 @@ void GPT2::sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer)
     std::mt19937 gen(rd());
 
     std::vector<int32_t> tokens = tokenizer.encode(opts.prompt);
-    const int max_ctx_size = opts.calculate_max_ctx_size(tokens.size());
+    const int prompt_length = tokens.size();
+    const int max_ctx_size = opts.calculate_max_ctx_size(prompt_length);
     tokens.reserve(max_ctx_size);
     const int logits_size = 50257;
     std::vector<std::pair<double, int>> logits_probs;
     logits_probs.reserve(logits_size);
     const int eot_token = 50256;
-    const int initial_pos = tokens.size();
 
-    // Total ntokens = Requested number of tokens + prompt num of tokens.
-    // int total_ntokens = opts.gen_tokens + tokens.size();
-    int total_ntokens = opts.gen_tokens;
-    // If the total_ntokens > max_prompt_size, generate up to
-    // max_prompt_size. Else generate up to requested size.
-    const int max_iter = total_ntokens > 1000 ? 1000 : total_ntokens;
-    // std::cout << "Mi=" << max_iter << ", in=" << initial_pos << "\n";
-	int64_t niter = 0;
+    // Max number of tokens we can produce.
+    const int max_iter = max_ctx_size - prompt_length; 
+    // Actual num of iters run to report performance per token.
+    int64_t n_iter = prompt_length - 1;
     // Use cerr because it is unbuffered.
     std::cerr << "\n[OUTPUT]: \n\n";
     std::cerr << opts.prompt;
     std::cerr << "\x1B[1;34m"; 
-    for (int i = initial_pos; i < max_iter; i++)
+    for (int i = 0; i < max_iter; i++)
     {
-        // TODO: allow creation of tensors with external non-owning data.
+        n_iter += 1;
+
         gten::Tensor input{(void*)tokens.data(), {(int32_t)tokens.size()}, gten::kInt32};
         gten::Tensor logits = this->logits(input);
 
@@ -268,7 +258,7 @@ void GPT2::sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer)
         for (int j = 0; j < logits_size; ++j)
             logits_probs.push_back(std::make_pair((double)logits_data[j] / opts.temp, j));
 
-        const int top_k = 40;
+        const int top_k = opts.top_k;
         
         // Select top k elements.
         std::partial_sort(
@@ -299,17 +289,17 @@ void GPT2::sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer)
 
         std::discrete_distribution dist(probs.begin(), probs.end());
         uint32_t maxi = dist(gen);
-        if (maxi == eot_token)
+        if (maxi == eot_token) {
+            std::cerr << "<|endoftext|>\n";
             break;
+        }
         std::cerr << tokenizer.decode(maxi);
         tokens.push_back(maxi);
-
-        niter += 1;
     }
     std::cerr << "\x1B[0m\n";
 
     if (opts.showstat)
-	   show_performance(niter, opts);
+	   show_performance(n_iter, opts);
 }
 
 void GPT2::show_performance(int64_t niter, const InferenceOptions& opts) const

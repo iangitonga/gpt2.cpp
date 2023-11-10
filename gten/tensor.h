@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 
 #include "gten_types.h"
 
@@ -45,12 +46,28 @@ static int64_t G_TensorMemAllocated = 0;
 class Tensor {
 public:
     Tensor() = default;
-    Tensor(const std::vector<int>& shape, TensorDtype dtype, float qscale = 0, int qzerop = 0);
-    Tensor(void* data_ptr, const std::vector<int>& shape, TensorDtype dtype, float qscale = 0, int qzerop = 0);
+    Tensor(const std::vector<int>& shape, TensorDtype dtype, bool zero_mem = false);
+    Tensor(const void* data_ptr, const std::vector<int>& shape, TensorDtype dtype);
     Tensor(const Tensor& rhs) = default;
     Tensor(Tensor&& rhs) = default;
     Tensor& operator=(const Tensor& rhs) = default;
-    Tensor &operator=(Tensor&& rhs) = default;
+    Tensor& operator=(Tensor&& rhs) = default;
+    friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor);
+    Tensor permute(const std::vector<int>& new_shape);
+    void print() const;
+    void print_info() const;
+    // Resize the tensor to have a new shape. This function does not perform
+    // any reallocation and therefore, the tensor must have enough capacity
+    // to accommodate the number of elements in the new shape.
+    // NOTE: The purpose of this function is to allow us to allocate for
+    // activations tensors to be able to hold all future predictions
+    // activations but reshape them as we continously add activations.
+    void resize(const std::vector<int>& new_shape);
+    void set_strides(const std::vector<int>& strides);
+    std::string shape_str() const;
+    std::string strides_str() const;
+    void save(const std::string& path) const;
+    Tensor view(const std::vector<int>& new_shape) const;
 
     // Get the pointer to internal data buffer.
     template <typename T>
@@ -136,26 +153,9 @@ public:
         qzerop_ = zerop;
     }
 
-    // Resize the tensor to have a new shape. The new shape must not be larger than the
-    // shape provided when the tensor was created because this function does not
-    // reallocate tensor storage.
-    // Note: this is not a reshape function because a reshape function can only reshape
-    // a tensor if the new and the existing shapes have the same number of elements.
-    void resize(const std::vector<int>& new_shape);
-
-    friend std::ostream& operator<<(std::ostream& stream, const Tensor& tensor);
-    void print() const;
-    void print_info() const;
-
-    Tensor view(const std::vector<int>& new_shape) const;
-    Tensor permute(const std::vector<int>& new_shape);
-    void set_strides(const std::vector<int>& strides);
-    std::string shape_str() const;
-    std::string strides_str() const;
-
 private:
     TensorDtype dtype_ = kFloat32;
-    std::shared_ptr<uint8_t[]> data_ptr_;
+    std::shared_ptr<uint8_t> data_ptr_;
     int storage_size_ = 0;  // in_bytes
     int numel_ = 0;
     std::vector<int> shape_;

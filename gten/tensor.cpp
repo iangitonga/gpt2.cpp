@@ -18,18 +18,20 @@ Types of tensors:
   ~ compute with offsets.
 */
 
+static void tensor_data_deleter(uint8_t* ptr) {
+    std::free(ptr);
+}
 
-Tensor::Tensor(const std::vector<int>& shape, TensorDtype dtype, float qscale, int qzerop)
-    : dtype_{dtype}, qscale_{qscale}, qzerop_{qzerop}
+Tensor::Tensor(const std::vector<int>& shape, TensorDtype dtype, bool zero_mem)
+    : dtype_{dtype}
 {
     validate_shape(shape);
-    // if (dtype == kQint8) {
-    //     GTEN_ASSERT(qscale != 0, "Expected non-zero scale for dtype Qint8 but got %d.", qscale);
-    // }
     const int numel = numel_from_shape(shape);
     const int alloc_bytes = numel * itemsize();
 
-    data_ptr_ = std::shared_ptr<uint8_t[]>(new uint8_t[alloc_bytes]);
+    void* raw_data_ptr = zero_mem ? std::calloc(alloc_bytes, 1) : std::malloc(alloc_bytes);
+
+    data_ptr_ = std::shared_ptr<uint8_t>(static_cast<uint8_t*>(raw_data_ptr), tensor_data_deleter);
     storage_size_ = alloc_bytes;
     G_TensorMemAllocated += alloc_bytes;
     numel_ = numel;
@@ -41,16 +43,14 @@ Tensor::Tensor(const std::vector<int>& shape, TensorDtype dtype, float qscale, i
 // An empty deleter allows us to use external data storage that we do not own.
 static void empty_deleter(uint8_t* ptr) {  }
 
-Tensor::Tensor(void* data_ptr, const std::vector<int>& shape, TensorDtype dtype, float qscale, int qzerop)
-    : dtype_{dtype}, qscale_{qscale}, qzerop_{qzerop}
+/// TODO: Add lock on the data ptr. [Unwritable tensor]. 
+Tensor::Tensor(const void* data_ptr, const std::vector<int>& shape, TensorDtype dtype)
+    : dtype_{dtype}
 {
-    // if (dtype == kQint8) {
-    //     GTEN_ASSERT(qscale != 0, "Expected non-zero scale for dtype Qint8 but got %d.", qscale);
-    // }
     GTEN_ASSERT(data_ptr != nullptr, "Expected a non-null pointer but got a nullptr.");
-    uint8_t* real_ptr = static_cast<uint8_t*>(data_ptr);
+    uint8_t* real_ptr = (uint8_t*)data_ptr;
     // An empty deleter ensures we do not delete the data since we do not own it.
-    data_ptr_ = std::shared_ptr<uint8_t[]>(real_ptr, empty_deleter);
+    data_ptr_ = std::shared_ptr<uint8_t>(real_ptr, empty_deleter);
     validate_shape(shape);
     shape_ = shape;
     set_strides_from_shape(shape);
@@ -79,12 +79,30 @@ int Tensor::numel_from_shape(const std::vector<int>& shape) const {
     return numel;
 }
 
+static std::string shape_to_str(const std::vector<int>& shape)
+{
+    std::stringstream s;
+    s << "(";
+    for (int i = 0; i < int(shape.size()); i++) {
+        s << shape[i];
+        if (i != int(shape.size()) - 1) {
+            s << ", ";
+        }
+    }
+    s << ")";
+    
+    return s.str();
+}
+
 // Contigous only???
 void Tensor::resize(const std::vector<int>& new_shape) {
     validate_shape(new_shape);
     const int new_size = numel_from_shape(new_shape) * itemsize();
     if (new_size > storage_size_) {
-        GTEN_ASSERT(false, "The new shape provided (cap=%d) exceeds storage capacity = %d.", new_size, storage_size_);
+        GTEN_ASSERT(
+            false,
+            "The new shape provided %s with cap=%d exceeds shape %s with cap=%d.",
+            shape_to_str(new_shape).c_str(), new_size, shape_str().c_str(), storage_size_);
     }
     shape_ = new_shape;
     set_strides_from_shape(new_shape);
@@ -215,6 +233,13 @@ std::string Tensor::strides_str() const {
     s << ")";
     
     return s.str();
+}
+
+void Tensor::save(const std::string& path) const
+{
+    std::ofstream fout{path, std::ios_base::binary};
+    GTEN_ASSERT(fout.is_open(), "Failed to save tensor at %s.", path.c_str());
+    fout.write(data_ptr<char>(), nbytes());
 }
 
 void Tensor::print_single(int item_idx, int col_idx, int n_cols) const

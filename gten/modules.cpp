@@ -9,9 +9,9 @@
 
 namespace gten {
 
-Embedding::Embedding(int n_vocab, int d_embed, int max_ctx, TensorDtype wdtype)
-    : weight{Tensor({n_vocab, d_embed}, wdtype)},
-      emb_acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+Embedding::Embedding(int n_vocab, int n_embd, int max_ctx, TensorDtype wdtype)
+    : weight{Tensor({n_vocab, n_embd}, wdtype)},
+      emb_acv_{Tensor({max_ctx, n_embd}, kFloat16)},
       proj_acv_{Tensor({n_vocab}, kFloat32)},
       max_ctx_(max_ctx)
 {
@@ -23,22 +23,19 @@ Tensor Embedding::forward(const Tensor& tokens) {
     return forward_impl(tokens);
 }
 
-
 Tensor Embedding::forward_impl(const Tensor& inp)
 {
-    const int d_embed = weight.size(1);
-    emb_acv_.resize({inp.numel(), d_embed});
+    const int n_embd = weight.size(1);
+    emb_acv_.resize({inp.numel(), n_embd});
 
-    // memcpy vs creating tensors?
-    // if (emb_acv_cached_) {
-    //     const int row_offset = inp.numel() - 1;
-    //     Tensor emb_acv = emb_acv_.row_offset_2d(row_offset);
-    //     ops::tensor_row_index(weight, inp.offset_1d(row_offset), emb_acv);
-    // } else {
-    //     ops::tensor_row_index(weight, inp, emb_acv_);
-    // }
+    if (emb_acv_cached_) {
+        const int ctx_offs = inp.numel() - 1;
+        ops::tensor_row_index(weight, inp, emb_acv_, ctx_offs);
+    } else {
+        emb_acv_cached_ = true;
 
-    ops::tensor_row_index(weight, inp, emb_acv_);
+        ops::tensor_row_index(weight, inp, emb_acv_);
+    }
 
     return emb_acv_;    
 }
@@ -58,11 +55,11 @@ Tensor Embedding::forward_proj_impl(const Tensor& inp) {
     return proj_acv_;  
 }
 
-PosEmbedding::PosEmbedding(int max_ctx, int d_embed, TensorDtype wdtype)
-    : weight{Tensor({max_ctx, d_embed}, wdtype)}, max_ctx_(max_ctx)
+PosEmbedding::PosEmbedding(int max_ctx, int n_embd, TensorDtype wdtype)
+    : weight{Tensor({max_ctx, n_embd}, wdtype)}, max_ctx_(max_ctx)
 {
     if (wdtype == kQint8) {
-        acv_ = Tensor({max_ctx, d_embed}, kFloat16);
+        acv_ = Tensor({max_ctx, n_embd}, kFloat16);
     }
 }
 
@@ -75,37 +72,38 @@ Tensor PosEmbedding::forward(int n_ctx) {
 Tensor PosEmbedding::forward_impl(int n_ctx)
 {
     if (weight.dtype() == kQint8) {
+        /// TODO: CACHE PREV VALUES. impl counter;
         const Qint8* weight_data = weight.data_ptr<Qint8>();
         Float16* out_data = acv_.data_ptr<Float16>();
-        const int d_embd = weight.size(1);
+        const int n_embd = weight.size(1);
         const float s = weight.scale();
         const int z = weight.zerop();
 
-        acv_.resize({n_ctx, d_embd});
+        acv_.resize({n_ctx, n_embd});
 
         for (int i = 0; i < n_ctx; i++) {
-            for (int j = 0; j < d_embd; j++) {
-                const float w = ops::deq(weight_data[i * d_embd + j], s, z);
-                out_data[i * d_embd + j] = fpcvt_stoh(w);
+            for (int j = 0; j < n_embd; j++) {
+                const float w = ops::deq(weight_data[i * n_embd + j], s, z);
+                out_data[i * n_embd + j] = fpcvt_stoh(w);
             }
         }
     } else {
         const Float16* weight_data = weight.data_ptr<Float16>();
 
         void* src_ptr = (void*)weight_data;
-        const int d_embed = weight.size(1);
+        const int n_embd = weight.size(1);
 
         // Shares the data with the weight tensor.
-        acv_ = Tensor{src_ptr, {n_ctx, d_embed}, weight.dtype()};
+        acv_ = Tensor{src_ptr, {n_ctx, n_embd}, weight.dtype()};
     }
     
     return acv_;
 }
 
-LayerNorm::LayerNorm(int max_ctx, int d_embed, TensorDtype wdtype)
-    : weight{Tensor({d_embed}, wdtype)},
-      bias{Tensor({d_embed}, wdtype)},
-      acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+LayerNorm::LayerNorm(int max_ctx, int n_embd, TensorDtype wdtype)
+    : weight{Tensor({n_embd}, wdtype)},
+      bias{Tensor({n_embd}, wdtype)},
+      acv_{Tensor({max_ctx, n_embd}, kFloat16)},
       max_ctx_{max_ctx}
 {
 }
@@ -119,7 +117,11 @@ Tensor LayerNorm::forward(const Tensor &inp) {
 
 
 Tensor LayerNorm::forward_impl(const Tensor &inp) {
-    acv_.resize({inp.size(0), inp.size(1)});
+    const int n_ctx = inp.size(0);
+    const int n_embd = inp.size(1);
+
+    acv_.resize({n_ctx, n_embd});
+
     
     if (acv_cached_) {
         const int ctx_offs = inp.size(0) - 1;
@@ -135,7 +137,7 @@ Tensor LayerNorm::forward_impl(const Tensor &inp) {
 
 
 GELU::GELU(int max_ctx, int n_out)
-    : acv_{Tensor({max_ctx, n_out}, kFloat16)}
+    : acv_{Tensor({max_ctx, n_out}, kFloat16)}, max_ctx_{max_ctx}
 {
 }
 
@@ -165,7 +167,7 @@ Tensor GELU::forward_impl(const Tensor& inp) {
 }
 
 Residual::Residual(int max_ctx, int n_out)
-    : acv_{Tensor({max_ctx, n_out}, kFloat16)}
+    : acv_{Tensor({max_ctx, n_out}, kFloat16)}, max_ctx_{max_ctx}
 {
 }
 
@@ -178,9 +180,9 @@ Tensor Residual::forward(const Tensor& inp0, const Tensor& inp1) {
 Tensor Residual::forward_impl(const Tensor& inp0, const Tensor& inp1)
 {
     const int n_ctx = inp0.size(0);
-    const int d_embed = inp0.size(1);
+    const int n_embd = inp0.size(1);
 
-    acv_.resize({n_ctx, d_embed});
+    acv_.resize({n_ctx, n_embd});
 
     if (acv_cached_) {
         const int ctx_offs = n_ctx - 1;
@@ -246,13 +248,13 @@ Tensor Linear::forward_transposed(const Tensor &inp) {
     return acv_;
 }
 
-MultiHeadSelfAttn::MultiHeadSelfAttn(int n_head, int d_embed, int max_ctx, TensorDtype wdtype)
-    : query{Linear(d_embed, d_embed, max_ctx, wdtype)},
-      key{Linear(d_embed, d_embed, max_ctx, wdtype)},
-      value{Linear(d_embed, d_embed, max_ctx, wdtype)},
-      qkv_proj{Linear(d_embed, d_embed, max_ctx, wdtype)},
-      qk_acv_{Tensor({n_head, max_ctx, max_ctx}, kFloat16)},
-      qkv_acv_{Tensor({max_ctx, d_embed}, kFloat16)},
+MultiHeadSelfAttn::MultiHeadSelfAttn(int n_head, int n_embd, int max_ctx, TensorDtype wdtype)
+    : query{Linear(n_embd, n_embd, max_ctx, wdtype)},
+      key{Linear(n_embd, n_embd, max_ctx, wdtype)},
+      value{Linear(n_embd, n_embd, max_ctx, wdtype)},
+      qkv_proj{Linear(n_embd, n_embd, max_ctx, wdtype)},
+      qk_acv_{Tensor({n_head, max_ctx, max_ctx}, kFloat16, /*zero_mem=*/true)},
+      qkv_acv_{Tensor({max_ctx, n_embd}, kFloat16)},
       n_head_{n_head}, max_ctx_{max_ctx}
 {
 }
@@ -267,15 +269,26 @@ Tensor MultiHeadSelfAttn::forward(const Tensor &inp) {
     return out;
 }
 
+void MultiHeadSelfAttn::reset_acv_cache()
+{
+    query.reset_acv_cache();
+    key.reset_acv_cache();
+    value.reset_acv_cache();
+    qkv_proj.reset_acv_cache();
+    qkv_cached_=false;
+
+    // Important because it is allocated with 'zero_mem'=true.
+    std::memset(qk_acv_.data_ptr<void>(), 0, qk_acv_.nbytes());
+}
 
 Tensor MultiHeadSelfAttn::masked_qkv_attn(const Tensor& q, const Tensor& k, const Tensor& v) {
     Timer timer{&time_attn_ms_};
 
     const int n_ctx = q.size(0);
-    const int d_embed = q.size(1);
+    const int n_embd = q.size(1);
 
     qk_acv_.resize({n_head_, n_ctx, n_ctx});
-    qkv_acv_.resize({n_ctx, d_embed});
+    qkv_acv_.resize({n_ctx, n_embd});
 
     if (qkv_cached_) {
         const int ctx_offs = n_ctx - 1;
@@ -289,15 +302,15 @@ Tensor MultiHeadSelfAttn::masked_qkv_attn(const Tensor& q, const Tensor& k, cons
     return qkv_acv_;
 }
 
-ResidualAttnBlock::ResidualAttnBlock(int n_attn_heads, int d_embed, int d_mlp, int max_ctx, TensorDtype wdtype)
-    : attn_ln{LayerNorm(max_ctx, d_embed, wdtype)},
-      attn{MultiHeadSelfAttn(n_attn_heads, d_embed, max_ctx, wdtype)},
-      inp_res{Residual(max_ctx, d_embed)},
-      mlp_ln{LayerNorm(max_ctx, d_embed, wdtype)},
-      mlp_fc{Linear(d_embed, d_mlp, max_ctx, wdtype)},
+ResidualAttnBlock::ResidualAttnBlock(int n_attn_heads, int n_embd, int d_mlp, int max_ctx, TensorDtype wdtype)
+    : attn_ln{LayerNorm(max_ctx, n_embd, wdtype)},
+      attn{MultiHeadSelfAttn(n_attn_heads, n_embd, max_ctx, wdtype)},
+      inp_res{Residual(max_ctx, n_embd)},
+      mlp_ln{LayerNorm(max_ctx, n_embd, wdtype)},
+      mlp_fc{Linear(n_embd, d_mlp, max_ctx, wdtype)},
       gelu{GELU(max_ctx, d_mlp)},
-      mlp_proj{Linear(d_mlp, d_embed, max_ctx, wdtype)},
-      attn_res{Residual(max_ctx, d_embed)}
+      mlp_proj{Linear(d_mlp, n_embd, max_ctx, wdtype)},
+      attn_res{Residual(max_ctx, n_embd)}
 {
 }
 

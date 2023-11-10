@@ -55,21 +55,21 @@ inline float deq(Qint8 x, float s, int z) {
 }
 
 
-static void tensor_row_index_impl(const Tensor& src, const Tensor& indices, Tensor& out) {
+static void tensor_row_index_impl(const Tensor& src, const Tensor& indices, Tensor& out, int ctx_offs) {
     const Float16* src_data = src.data_ptr<Float16>();
     const int* indices_data = indices.data_ptr<int>();
     Float16* out_data = out.data_ptr<Float16>();
     const int rowsize = src.size(1);
     const size_t rowsizebytes = rowsize * src.itemsize();
 
-    for (int i = 0; i < indices.numel(); i++) {
+    for (int i = ctx_offs; i < indices.numel(); i++) {
         const void* src_data_start = src_data + indices_data[i] * rowsize;
         void* out_data_start = out_data + i * rowsize;
         std::memcpy(out_data_start, src_data_start, rowsizebytes);
     }
 }
 
-static void tensor_row_index_impl_q8(const Tensor& src, const Tensor& indices, Tensor& out) {
+static void tensor_row_index_impl_q8(const Tensor& src, const Tensor& indices, Tensor& out, int ctx_offs) {
     const Qint8* src_data = src.data_ptr<Qint8>();
     const int* indices_data = indices.data_ptr<int>();
     Float16* out_data = out.data_ptr<Float16>();
@@ -78,7 +78,7 @@ static void tensor_row_index_impl_q8(const Tensor& src, const Tensor& indices, T
     const float s = src.scale();
     const int z = src.zerop();
 
-    for (int i = 0; i < indices.numel(); i++) {
+    for (int i = ctx_offs; i < indices.numel(); i++) {
         const Qint8* src_data_start = src_data + indices_data[i] * rowsize;
         Float16* out_data_start = out_data + i * rowsize;
         for (int j = 0; j < rowsize; j++) {
@@ -92,16 +92,16 @@ static void tensor_row_index_impl_q8(const Tensor& src, const Tensor& indices, T
 /// @param indices A 1-d tensor of indices with dtype = int.
 /// @param out A 2d tensor with enough capacity to fit the indexed rows. Its dtype
 ///  must be the same as source tensor.
-void tensor_row_index(const Tensor& src, const Tensor& indices, Tensor& out) {
+void tensor_row_index(const Tensor& src, const Tensor& indices, Tensor& out, int ctx_offs = 0) {
     GTEN_ASSERT_NDIMS_DTYPE(src, 2, kFloat16);
     GTEN_ASSERT_NDIMS_DTYPE(indices, 1, kInt32);
     GTEN_ASSERT_NDIMS_DTYPE(out, 2, kFloat16);
     GTEN_ASSERT_2D_SHAPE(out, indices.size(0), src.size(1));
 
     if (src.dtype() == kQint8) {
-        tensor_row_index_impl_q8(src, indices, out);
+        tensor_row_index_impl_q8(src, indices, out, ctx_offs);
     } else {
-        tensor_row_index_impl(src, indices, out);
+        tensor_row_index_impl(src, indices, out, ctx_offs);
     }
 }
 
@@ -419,12 +419,12 @@ void affine_proj_2d_transposed_impl_q8(const Tensor& x, const Tensor& w, const T
 /// @param out A tensor of shape (d_out, n_ctx).
 void affine_proj_2d_transposed(const Tensor& x, const Tensor& w, const Tensor& bias, Tensor& out, int ctx_offs = 0) {
     const int n_ctx = x.size(0);
-    const int nstate = x.size(1);
+    const int n_embd = x.size(1);
     const int dout = w.size(0);
 
     GTEN_ASSERT_NDIMS_DTYPE(x, 2, kFloat16);
     GTEN_ASSERT_NDIMS_DTYPE(w, 2, kFloat16);
-    GTEN_ASSERT_DIMSIZE(w, 1, nstate);
+    GTEN_ASSERT_DIMSIZE(w, 1, n_embd);
     GTEN_ASSERT_NDIMS_DTYPE(bias, 1, kFloat16);
     GTEN_ASSERT_DIMSIZE(bias, 0, dout);
     GTEN_ASSERT_2D_SHAPE(out, dout, n_ctx);
@@ -646,12 +646,57 @@ static void layer_norm(const Tensor& x, const Tensor& w, const Tensor& bias, Ten
     }
 }
 
+/*
+
+[Q|K]: [physical_layout](n_ctx, n_head, d_head)
+[
+  [[----1----],        
+   [----2----]],
+
+  [[----3----],
+   [----4----]]
+]
+
+[Q|K]: [logical_layout](n_head, n_ctx, d_head)
+Note: K should be (n_head, d_head, n_ctx) but it is transposed for efficiency.
+[
+  [[----1----],        
+   [----3----]], <---
+
+  [[----2----],  <---
+   [----4----]]
+]
+
+Q @ K: [logical_layout]
+[n_head=2, n_ctx=2, d_head]
+[                    [                       [                          [
+  [[----A----],        [[----A----],           [[A.A, A.B],               [[A.A, ___],
+   [----B----]],        [----B----]],           [B.A, B.B]],               [B.A, B.B]],
+                   @                     =                      mask =>
+  [[----C----],        [[----C----],           [[C.C, C.D],               [[C.C, ___],
+   [----D----]]         [----D----]]            [D.C, D.D]]                [D.C, D.D]]
+]                    ]                       ]                          ]
+
+-------------------------------------------------------------
+[n_head=2, n_ctx=3, d_head]
+[                    [                       [                             [
+  [[----A----],        [[----A----],           [[A.A, A.B, A.E],             [[A.A, ___, _._],
+   [----B----],         [----B----],            [B.A, B.B, B.E],              [B.A, B.B, _._],
+   [----E----]],        [----E----]],           [E.A, E.B, E.E]],             [E.A, E.B, E.E]],
+                   @                     =                         mask =>
+  [[----C----],        [[----C----],           [[C.C, C.D, C.F],             [[C.C, ___, _._],
+   [----D----],         [----D----],            [D.C, D.D, D.F],              [D.C, D.D, _._],
+   [----F----]],        [----F----]],           [F.C, F.D, F.F]],             [F.C, F.D, F.F]],
+]                    ]                       ]                             ]
+
+*/
 
 /// @brief Computes (Q @ K) * scale_factor and masks the results.
 /// @param q Tensor of shape (n_head, n_ctx, d_head).
 /// @param k Tensor of shape (n_head, n_ctx, d_head).
 /// @param qk_out Tensor of shape (n_head, n_ctx, n_ctx).
-void qk_masked(const Tensor& q, const Tensor& k, Tensor& qk_out, float scale_factor, int offs=0) {
+/// @param ctx_offs Offset to the input context vector.
+void qk_masked(const Tensor& q, const Tensor& k, Tensor& qk_out, float scale_factor, int ctx_offs=0) {
     const Float16* q_data = q.data_ptr<Float16>();
     const Float16* k_data = k.data_ptr<Float16>();
     Float16* out_data = qk_out.data_ptr<Float16>();
@@ -668,11 +713,14 @@ void qk_masked(const Tensor& q, const Tensor& k, Tensor& qk_out, float scale_fac
     const int qkst1 = qk_out.stride(1);
 
     for (int h = 0; h < nhead; h++) {
-        for (int qrow = offs; qrow < n_ctx; qrow++) {
+        for (int qrow = ctx_offs; qrow < n_ctx; qrow++) {
+            // For each vector in the current head of Q, we only compute the
+            // dot_products that are not subsequently masked. That reduces the
+            // number of dot products on each head by half.
             const int kcol_max = qrow + 1;
             for (int kcol = 0; kcol < kcol_max; kcol++) {
                 const Float16* qrow_data = q_data + (h * qst0 + qrow * qst1);
-                const Float16* kcol_data = k_data + (h * kst0 + kcol * kst1);
+                const Float16* kcol_data = k_data + (h * kst0 + kcol * kst1); // col_data is contigous.
                 const float dot_prod = dot_product(qrow_data ,kcol_data, d_head);
                 out_data[h * qkst0 + qrow * qkst1 + kcol] = fpcvt_stoh(dot_prod * scale_factor);
             }
@@ -680,11 +728,29 @@ void qk_masked(const Tensor& q, const Tensor& k, Tensor& qk_out, float scale_fac
     }
 
     // masking
-    for (int h = 0; h < nhead; h++) {
-        for (int qrow = offs; qrow < n_ctx; qrow++) {
-            const int k_start = qrow + 1;
-            for (int kcol = k_start; kcol < n_ctx; kcol++) {
-                out_data[h * qkst0 + qrow * qkst1 + kcol] = fpcvt_stoh(-std::numeric_limits<float>::infinity());
+    // When offs is non-zero, it means we are only computing attention between the
+    // vector representing the previously predicted token and the rest of the
+    // vectors in the prompt. if the prev QK was [n_head, n_ctx, n_ctx], the new QK
+    // will be of shape [n_head, n_ctx + 1, n_ctx + 1] where a new column and a new
+    // row is added. The new column consists of dot products between the earlier
+    // prompt vectors and the new prompt vector which need to be masked but we can
+    // skip masking because their computations were skipped and thus, in the
+    // memory, their values are zero (guaranteed because calloc is used to allocate
+    // for the qk acv tensor). Zero values are only correct if we also
+    // ignore re-computing softmax over them because values masked to -inf map to zero
+    // after softmax. The significance of skipping masking for new columns (except the
+    // last column which belongs to the new row) is to allow us to skip recomputing
+    // softmax from scratch each time which drags performance down. As for the new row,
+    // we can also skip it because none of the values are masked. However, we need to
+    // compute softmax over the new row in each head.
+    if (ctx_offs == 0) {
+        for (int h = 0; h < nhead; h++) {
+            /// TODO: Should we skip?
+            for (int qrow = 0; qrow < n_ctx; qrow++) {
+                const int k_start = qrow + 1;
+                for (int kcol = k_start; kcol < n_ctx; kcol++) {
+                    out_data[h * qkst0 + qrow * qkst1 + kcol] = fpcvt_stoh(-std::numeric_limits<float>::infinity());
+                }
             }
         }
     }
@@ -772,9 +838,9 @@ void qkv_matmul(const Tensor& qk, const Tensor& v, Tensor& qkv_out, int offs=0) 
 static void qkv_attn_impl(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& qk, Tensor& qkv, int max_ctx, int ctx_offs)
 {
     const int n_ctx = q.size(0);
-    const int nstate = q.size(1);
+    const int n_embd = q.size(1);
     const int nhead = qk.size(0);
-    const int dhead = nstate / nhead;
+    const int dhead = n_embd / nhead;
 
     const Tensor q0 = q.view({n_ctx, nhead, dhead}).permute({1, 0, 2});
     const Tensor k0 = k.view({n_ctx, nhead, dhead}).permute({1, 0, 2});

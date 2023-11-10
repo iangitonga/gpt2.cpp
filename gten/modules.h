@@ -101,6 +101,7 @@ public:
 
 private:
     Tensor acv_;
+    int max_ctx_;
     bool acv_cached_{false};
     int64_t exec_time_ms_{0};
 
@@ -117,6 +118,7 @@ public:
 
 private:
     Tensor acv_;
+    int max_ctx_;
     bool acv_cached_{false};
     int64_t exec_time_ms_{0};
 
@@ -155,13 +157,7 @@ public:
     Tensor forward(const Tensor& inp);
     int64_t time_linear() const noexcept { return query.time() + key.time() + value.time() + qkv_proj.time(); }
     int64_t time_attn() const noexcept { return time_attn_ms_; }
-    void reset_acv_cache() noexcept {
-        query.reset_acv_cache();
-        key.reset_acv_cache();
-        value.reset_acv_cache();
-        qkv_proj.reset_acv_cache();
-        qkv_cached_=false;
-    }
+    void reset_acv_cache();
 
 public:
     Linear query;

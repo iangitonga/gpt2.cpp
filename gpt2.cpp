@@ -17,14 +17,15 @@ gpt2 [options] -p PROMPT  for a single prompt or
 gpt2 [options] for a chat interface. 
 
 Optional args.
--sm :      Use small model (117M) for inference.
--md :      Use medium model (345M) for inference. This model is chosen by default.
+-sm :      Use small model (117M) for inference. [default].
+-md :      Use medium model (345M) for inference.
 -lg :      Use large model (762M) for inference.
 -xl :      Use extra-large model (1.5B) for inference.
 -q8 :      [Experimental]: Use quantized model for inference. Only for large and x-large models.
 -debug   : See debug-level information.
 --temp T : Temperature to use during sampling. It must be greater than 0. [default=0.9].
---len  L : Number of words to generate. Minimum is 1 and max is 1000. [default=200].
+--len  N : Number of tokens to generate. Minimum is 1 and max is 1000. [default=200].
+--topk K : Top tokens to randomly select from during prediction. [default=40].
 
 Examples:
   ./gpt2 -p "Once upon a time" 
@@ -34,29 +35,7 @@ Examples:
 )";
 
 // TODO:
-// Arbitrary text.
-// max_ctx
-// set n_threads.
-
-/*
-
-[performance]: single-thread
-sm:  43ms
-md: 116ms x2.7
-lg: 250ms x2.2
-lgq:
-xl: 573ms x2.2
-xlq:
-
-[performance]: multithreaded
-sm:  57ms x1.3
-md: 132ms x1.1
-lg: 246ms x0.98
-xl: 526ms x0.91
-
-Either cpu oversaturation or no-improvements.
-
-*/
+// Quantize
 
 int main(int argc, char const *argv[])
 {
@@ -142,7 +121,26 @@ int main(int argc, char const *argv[])
                 std::cerr << "Length must be greater than 1 and less than 1000.\n";
                 return -1;
             }
-            options.gen_tokens = len;
+            options.n_predict = len;
+            i += 1;
+        }
+        else if (arg == "--topk") {
+            if (argc <= i+1) {
+                std::cerr << "topk value is missing.\n";
+                return -1;
+            }
+            int top_k;
+            try {
+                top_k = std::stoi(argv[i+1]);
+            } catch (...) {
+                std::cerr << "Invalid topk value.\n";
+                return -1;
+            }
+            if (top_k < 1 || top_k > 1000) {
+                std::cerr << "topk must be greater than or equal to 1 and less than or equal to 1000.\n";
+                return -1;
+            }
+            options.top_k = top_k;
             i += 1;
         }
         else {
@@ -172,6 +170,7 @@ int main(int argc, char const *argv[])
     if (options.debug_mode) {
         std::cout << config;
     }
+
     GPT2Tokenizer tokenizer = load_tokenizer(checkpoint);
     const int num_prompt_tokens = tokenizer.encode(options.prompt).size();
     const int max_ctx = options.calculate_max_ctx_size(num_prompt_tokens);
