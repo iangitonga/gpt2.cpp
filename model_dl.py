@@ -19,7 +19,7 @@ MODELS_URLS = {
         "qint8": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-large.q8.gten"
     },
     "Gpt2-xl": {
-        "float16": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-xl.f16.gten",
+        "float16": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-xl.fp16.gten",
         "qint8": "https://huggingface.co/iangitonga/gten/resolve/main/Gpt2-xl.q8.gten"
     }
 }

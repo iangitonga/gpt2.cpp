@@ -395,7 +395,7 @@ def download_and_convert(model_name, out_dtype, q_blk_id, model_path, vocab_path
 parser = argparse.ArgumentParser()
 parser.add_argument("model", help="Model name to be converted.", choices=MODEL_CONFIG.keys())
 parser.add_argument("--out_dtype", help="Output data format. default is f16.", choices=OUT_DTYPES, default="f16")
-parser.add_argument("--qblock_size", help="Quantize block size id. default is B32.", choices=QINT_BLOCK_SIZES, default="B32")
+parser.add_argument("--qblock_size", help="Quantize block size id. default is B32.", choices=QINT_BLOCK_SIZES, default="B64")
 parser.add_argument("--mpath", help="Optional path to source model if you have it locally.")
 parser.add_argument("--vpath", help="Optional path to vocab if you have it locally.")
 
