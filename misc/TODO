@@ -1,0 +1,9 @@
+TODO list (not ordered):
+* Implement multi-threading via omp and improve buffers allocation strategy.
+* Implement ModuleOptions/ModelOptions that allow for better global
+  model configuration. E.g max_ctx, weights & actv dtype, caching
+  behavior, e.t.c.
+* Integrate clang tools. Analyzers, diagnostics, e.t.c
+* Implement 4-Bit quantization and compare perf to f16 and q8.
+
+- Infinite prediction until <eot> token.

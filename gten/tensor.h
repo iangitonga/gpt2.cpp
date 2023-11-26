@@ -7,47 +7,21 @@
 #include <iostream>
 
 #include "gten_types.h"
-
-
-// Assert that the given boolean is true. If false, print message and terminate program.
-// TODO: Replace with C++ 20 __VA_OPT__, __VA_ARGS__ may not work on non-gcc compilers.
-#define GTEN_ASSERT(condition, message, ...)                                              \
-    if (__glibc_unlikely(!(condition))) {                                                                   \
-        std::fprintf(stderr, "\x1B[1;31m");                                             \
-        std::fprintf(stderr, "\nGTEN ERROR [File `%s` line %d]: ", __FILE__, __LINE__);   \
-        std::fprintf(stderr, message, ##__VA_ARGS__);                                   \
-        std::fprintf(stderr, "\n");                                                     \
-        std::exit(EXIT_FAILURE);                                                        \
-    }
+#include "log.h"
+#include "quants.h"
 
 
 namespace gten {
 
-// class TensorDims {
-//     TensorDims(std::initializer_list<int> dims) {
-//         GTEN_ASSERT(dims.size() <= 3, "Expected ndims <=3 but got ndims=%ld.", dims.size());
-//         for (int i = 0; i < dims.size(); i++) {
-//             const int dim = *(dims.begin() + i);
-//             GTEN_ASSERT(dim > 0, "The value of dimension %d: %d of the given shape is invalid!", i, dim);
-//             shape_[i] = dim;
-//         }
-//     }
-//     friend std::ostream& operator<<(std::ostream& stream, TensorDims dims);
-
-// private:
-//     int shape_[3];
-//     int strides_[3];
-//     int dimsize;
-// };
-
+// TODO: make inside tensor.
 static int64_t G_TensorMemAllocated = 0;
 
 
 class Tensor {
 public:
     Tensor() = default;
-    Tensor(const std::vector<int>& shape, TensorDtype dtype, bool zero_mem = false);
-    Tensor(const void* data_ptr, const std::vector<int>& shape, TensorDtype dtype);
+    Tensor(const std::vector<int>& shape, Dtype dtype, int qblock_size = 0, bool zero_mem = false);
+    Tensor(const void* data_ptr, const std::vector<int>& shape, Dtype dtype);
     Tensor(const Tensor& rhs) = default;
     Tensor(Tensor&& rhs) = default;
     Tensor& operator=(const Tensor& rhs) = default;
@@ -80,7 +54,7 @@ public:
         return reinterpret_cast<const T*>(data_ptr_.get()); 
     }
 
-    TensorDtype dtype() const {
+    Dtype dtype() const {
         return dtype_;
     }
 
@@ -96,14 +70,16 @@ public:
             case kFloat32:
                 return 4;
             default:
-                std::cout << "defaulting on itemsize\n";
+                GTEN_ASSERT(false);
                 return 4;
         }
     }
 
-    int ndims() const {
-        return shape_.size();
-    }
+    bool is_quantized() const  { return dtype_ == kQint8; }
+    bool is_1d() const { return shape_.size() == 1; }
+    bool is_2d() const { return shape_.size() == 2; }
+    bool is_3d() const { return shape_.size() == 3; }
+    int ndims() const { return shape_.size(); }
 
     // Get the number of elems in the tensor.
     int numel() const {
@@ -112,17 +88,13 @@ public:
 
     /// Returns the size of the give dimension.
     int size(int i) const {
-        GTEN_ASSERT(i < int(shape_.size()),
-                    "The given index `%d` is out of range of shape with size `%d`.",
-                    i, int(shape_.size()));
+        GTEN_ASSERT(i < int(shape_.size()));
         return shape_[i];
     }
 
     /// Returns the size of the give dimension.
     int stride(int i) const {
-        GTEN_ASSERT(i < int(strides_.size()),
-                    "The given index `%d` is out of range of stride with size `%d`.",
-                    i, int(strides_.size()));
+        GTEN_ASSERT(i < int(strides_.size()));
         return strides_[i];
     }
 
@@ -138,35 +110,27 @@ public:
         return shape == shape_;
     }
 
-    float scale() const {
-        return qscale_;
+    const Qparams& qparams() const { 
+        return qparams_;
     }
 
-    int zerop() const {
-        return qzerop_;
-    }
-
-    void set_qparams(float scale, int zerop) {
-        GTEN_ASSERT(dtype_ == kQint8, "Qparams can only be set for dtype=Qint8, not %s.", dtype_str(dtype_));
-        GTEN_ASSERT(scale != 0, "Expected non-zero scale for dtype Qint8 but got %f.", scale);
-        qscale_ = scale;
-        qzerop_ = zerop;
+    Qparams& qparams() { 
+        return qparams_;
     }
 
 private:
-    TensorDtype dtype_ = kFloat32;
+    Dtype dtype_ = kFloat32;
     std::shared_ptr<uint8_t> data_ptr_;
     int storage_size_ = 0;  // in_bytes
     int numel_ = 0;
     std::vector<int> shape_;
     std::vector<int> strides_;
-    float qscale_ = 0.0f;
-    int qzerop_ = 0;
+    Qparams qparams_;
 
     void validate_shape(const std::vector<int>& shape) const;
     void set_strides_from_shape(const std::vector<int>& shape);
     int numel_from_shape(const std::vector<int>& shape) const;
-    void print_single(int item_idx, int col_idx, int n_cols) const;
+    void print_single(int item_idx, int row_idx, int col_idx, int n_cols) const;
 };
 
 } // Namespace xten

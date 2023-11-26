@@ -34,8 +34,6 @@ Examples:
   ./gpt2
 )";
 
-// TODO:
-// Quantize
 
 int main(int argc, char const *argv[])
 {
@@ -46,6 +44,14 @@ int main(int argc, char const *argv[])
     }
     
     InferenceOptions options{};
+
+    // -sm -q8 -greedy -debug -stat -p "Once upon a time"
+    // options.model_name = "Gpt2";
+    // options.dtype = kQint8;
+    // options.greedy = true;
+    // options.debug_mode = true;
+    // options.showstat = true;
+    // options.prompt = "Once upon a time";
 
     for (int i = 1; i < argc; i++)
     {
@@ -163,7 +169,7 @@ int main(int argc, char const *argv[])
     }
 
     std::ifstream checkpoint{options.get_model_path(), std::ios::binary};
-    GTEN_ASSERT(checkpoint.is_open(), "error opening model: %s", options.get_model_path().c_str());
+    GTEN_ASSERTM(checkpoint.is_open(), "error opening model: %s", options.get_model_path().c_str());
     verify_magic_number(checkpoint);
     GPT2Config config;
     checkpoint.read(reinterpret_cast<char*>(&config), sizeof(config));

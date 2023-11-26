@@ -17,7 +17,7 @@ struct InferenceOptions {
     bool debug_mode {false};
     bool greedy {false};
     bool showstat {false};
-    TensorDtype dtype {kFloat16};
+    Dtype dtype {kFloat16};
 
     std::string get_dl_command() const {
 #if defined(__WIN32__) || defined(_WIN32) || defined(WIN32) || defined(__CYGWIN__) || defined(__MINGW32__)
@@ -60,7 +60,7 @@ struct InferenceOptions {
             // arbitrary-length documents by selecting the last 1024 context tokens and using
             // that to predict the next token but once the prompt reaches max_ctx_size, caching
             // cannot be used and thus prediction becomes very slow.
-            GTEN_ASSERT(false, "Prompt length is too large!");
+            GTEN_ASSERTM(false, "Prompt length is too large!");
         }
         // How many tokens: n_predict + prompt tokens
         int ctx_size = num_prompt_tokens + n_predict;
@@ -94,12 +94,17 @@ struct GPT2Config
 
 class GPT2 {
 public:
-    GPT2(std::ifstream& checkpoint, const GPT2Config& config, int max_ctx, TensorDtype wdtype);
+    GPT2(std::ifstream& checkpoint, const GPT2Config& config, int max_ctx, Dtype dtype);
     Tensor logits(const Tensor &inp);
+    Tensor prelogits(const Tensor &inp); // for perplexity calculation.
     void show_performance(int64_t niter, const InferenceOptions& opts) const;
+    size_t get_model_size(bool debug) const;
     void sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer);
     void greedy_sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer);
     void reset_acv_caches();
+    Tensor wte_weight() {
+        return wte_.weight;
+    }
 
 public:
     GPT2Config config;
@@ -113,14 +118,14 @@ private:
     int64_t time_sample_ms_ = 0;
     int64_t time_load_ms_ = 0;
 
-    void load_from_checkpoint(std::ifstream& checkpoint);
+    void load_from_checkpoint(std::ifstream& checkpoint, Dtype dtype);
 };
 
 static void verify_magic_number(std::ifstream& checkpoint) {
     const int64_t expected_magic = 0x454c49464e455447;
     int64_t magic;
     checkpoint.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    GTEN_ASSERT(magic == expected_magic, "Magic number in the binary does not match the expected one.\n");
+    GTEN_ASSERTM(magic == expected_magic, "Magic number in the binary does not match the expected one.\n");
 }
 
 static GPT2Tokenizer load_tokenizer(std::ifstream& checkpoint) {
@@ -136,35 +141,77 @@ static GPT2Tokenizer load_tokenizer(std::ifstream& checkpoint) {
 }
 
 
-GPT2::GPT2(std::ifstream& checkpoint, const GPT2Config& config_, int max_ctx, TensorDtype wdtype)
-    : config{config_},
-      wte_{Embedding(config.n_vocab, config.n_embed, max_ctx, wdtype)},
-      wpe_{PosEmbedding(config.n_ctx, config.n_embed, wdtype)},
-      ln_f_{LayerNorm(max_ctx, config.n_embed, wdtype)},
-      res_{Residual(max_ctx, config.n_embed)}
+static inline int32_t read_qblock_size(std::ifstream& fin) {
+    std::string section_name;
+    int32_t section_name_size;
+    fin.read(reinterpret_cast<char*>(&section_name_size), sizeof(section_name_size));
+    section_name.resize(section_name_size);
+    fin.read(reinterpret_cast<char*>(section_name.data()), section_name_size);
+
+    GTEN_ASSERT(section_name == "quants.info");
+    // std::cout << "Section: " << section_name << "\n";
+
+    int32_t block_size;
+    fin.read(reinterpret_cast<char*>(&block_size), sizeof(block_size));
+
+    GTEN_ASSERT(block_size > 0);
+    GTEN_ASSERT(block_size % 32 == 0);
+
+    return block_size;
+}
+
+
+GPT2::GPT2(std::ifstream& checkpoint, const GPT2Config& config_, int max_ctx, Dtype dtype)
+    : config{config_}
 {
-    blocks_.reserve(config.n_layer);
-    for (int i = 0; i < config.n_layer; i++) {
-        blocks_.push_back(ResidualAttnBlock(config_.n_head, config_.n_embed, 4*config_.n_embed, max_ctx, wdtype));
+    int qblock_size = 0;
+    if (dtype == kQint8) {
+        qblock_size = read_qblock_size(checkpoint);
+        std::cout << "Qblock size: " << qblock_size << "\n";
     }
 
-    load_from_checkpoint(checkpoint);
+    wte_ = Embedding(config.n_vocab, config.n_embed, max_ctx, dtype, qblock_size);
+    wpe_ = PosEmbedding(config.n_ctx, config.n_embed, dtype, qblock_size);
+    ln_f_ = LayerNorm(max_ctx, config.n_embed, dtype, qblock_size);
+    res_ = Residual(max_ctx, config.n_embed, dtype, qblock_size);
+
+    blocks_.reserve(config.n_layer);
+    for (int i = 0; i < config.n_layer; i++) {
+        blocks_.push_back(ResidualAttnBlock(config_.n_head, config_.n_embed, 4*config_.n_embed, max_ctx, dtype, qblock_size));
+    }
+
+    load_from_checkpoint(checkpoint, dtype);
 }
 
 Tensor GPT2::logits(const Tensor &inp)
 {
     Tensor logits = res_.forward(wte_.forward(inp), wpe_.forward(inp.size(0)));
+
     for (auto &block : blocks_)
         logits = block.forward(logits);
+
     logits = ln_f_.forward(logits);
     logits = wte_.forward_proj(logits);
 
     return logits;
 }
 
+Tensor GPT2::prelogits(const Tensor &inp)
+{
+    Tensor prelogits = res_.forward(wte_.forward(inp), wpe_.forward(inp.size(0)));
+
+    for (auto &block : blocks_)
+        prelogits = block.forward(prelogits);
+
+    prelogits = ln_f_.forward(prelogits);
+
+    return prelogits;
+}
+
 void GPT2::reset_acv_caches() {
     res_.reset_acv_cache();
     wte_.reset_acv_cache();
+    wpe_.reset_acv_cache();
     for (auto &block : blocks_)
         block.reset_acv_cache();
     ln_f_.reset_acv_cache();
@@ -299,7 +346,7 @@ void GPT2::sample(const InferenceOptions& opts, GPT2Tokenizer& tokenizer)
     std::cerr << "\x1B[0m\n";
 
     if (opts.showstat)
-	   show_performance(n_iter, opts);
+       show_performance(n_iter, opts);
 }
 
 void GPT2::show_performance(int64_t niter, const InferenceOptions& opts) const
@@ -334,42 +381,22 @@ void GPT2::show_performance(int64_t niter, const InferenceOptions& opts) const
     const int64_t total_inference = emb_time + emb_proj_time + wpe_time + linear_time + attn_time
                     + ln_time + gelu_time + res_time;
 
-    int64_t model_size_mb;
-    if (opts.model_name == "Gpt2") {
-        model_size_mb = 250;
-    } else if (opts.model_name == "Gpt2-medium") {
-        model_size_mb = 710;
-    } else if (opts.model_name == "Gpt2-large") {
-        if (opts.dtype == kFloat16) {
-            model_size_mb = 1500;
-        } else {
-            model_size_mb = 750;
-        }
-    } else if (opts.model_name == "Gpt2-xl") {
-        if (opts.dtype == kFloat16) {
-            model_size_mb = 3000;
-        } else {
-            model_size_mb = 1600;
-        }
-    } else {
-        GTEN_ASSERT(false, "Unexpected model name: %s", opts.model_name.c_str());
-    }
-    const int64_t tot_mem_usage_mb = G_TensorMemAllocated / (1024 * 1024);
-    const int64_t mem_usage_model = model_size_mb;
+    const int64_t tot_mem_usage_mb = G_TensorMemAllocated / 1000000;
+    const int64_t mem_usage_model = get_model_size(/*debug=*/false) / 1000000;
     const int64_t mem_usage_acvs = tot_mem_usage_mb - mem_usage_model;
 
     std::cout << "\n-------------------------------\n";
     std::cout << " " << "PERFORMANCE\n";
-    std::cout << "-------------------------------\n";
-    std::cout << " " << "Mem usage [total]   : " << std::setw(4) << tot_mem_usage_mb << "MB\n";
-    std::cout << " " << "Mem usage [model]   : " << std::setw(4) << mem_usage_model << "MB\n";
-    std::cout << " " << "Mem usage [actvs]   : " << std::setw(4) << mem_usage_acvs << "MB\n";
     std::cout << "------------------------------\n";
     std::cout << " " << "Inference [per tok] : " << std::setw(5) << total_inference/niter << "ms\n";
     std::cout << " " << "Sample time         : " << std::setw(5) << time_sample_ms_ << "ms\n";
     std::cout << " " << "Load time           : " << std::setw(5) << time_load_ms_ << "ms\n";
     std::cout << " " << "Inference [total]   : " << std::setw(5) << total_inference << "ms\n";
-    std::cout << " " << "Total runtime       : " << std::setw(5) << time_load_ms_ + time_sample_ms_ + total_inference << "ms\n\n";
+    std::cout << " " << "Total runtime       : " << std::setw(5) << time_load_ms_ + time_sample_ms_ + total_inference << "ms\n";
+    std::cout << "-------------------------------\n";
+    std::cout << " " << "Mem usage [total]   : " << std::setw(4) << tot_mem_usage_mb << "MB\n";
+    std::cout << " " << "Mem usage [model]   : " << std::setw(4) << mem_usage_model << "MB\n";
+    std::cout << " " << "Mem usage [actvs]   : " << std::setw(4) << mem_usage_acvs << "MB\n\n";
 
     if (opts.debug_mode) {
         std::cout << "--------------------------------------\n";
@@ -392,6 +419,61 @@ void GPT2::show_performance(int64_t niter, const InferenceOptions& opts) const
     }
 }
 
+size_t GPT2::get_model_size(bool debug) const {
+    const auto tensor_bytes = [](const Tensor& t) { return t.nbytes() + t.qparams().nbytes(); };
+
+    const size_t emb_mem = tensor_bytes(wte_.weight);
+    const size_t emb_mem_mb = emb_mem/ 1000000;
+    const size_t pos_emb_mem = tensor_bytes(wpe_.weight);
+    const size_t pos_emb_mem_mb = pos_emb_mem / 1000000;
+    size_t lin_weight_mem = 0;
+    size_t lin_bias_mem = 0;
+    size_t lnorm_mem = 0;
+    for (const auto& block : blocks_)
+    {
+        lin_weight_mem += tensor_bytes(block.attn.query.weight);
+        lin_bias_mem += tensor_bytes(block.attn.query.bias);
+        lin_weight_mem += tensor_bytes(block.attn.key.weight);
+        lin_bias_mem += tensor_bytes(block.attn.key.bias);
+        lin_weight_mem += tensor_bytes(block.attn.value.weight);
+        lin_bias_mem += tensor_bytes(block.attn.value.bias);
+        lin_weight_mem += tensor_bytes(block.attn.qkv_proj.weight);
+        lin_bias_mem += tensor_bytes(block.attn.qkv_proj.bias);
+        lin_weight_mem += tensor_bytes(block.mlp_fc.weight);
+        lin_bias_mem += tensor_bytes(block.mlp_fc.bias);
+        lin_weight_mem += tensor_bytes(block.mlp_proj.weight);
+        lin_bias_mem += tensor_bytes(block.mlp_proj.bias);
+
+        lnorm_mem += tensor_bytes(block.mlp_ln.weight) + tensor_bytes(block.mlp_ln.bias);
+        lnorm_mem += tensor_bytes(block.attn_ln.weight) + tensor_bytes(block.attn_ln.bias);
+    }
+
+    lnorm_mem += tensor_bytes(ln_f_.weight) + tensor_bytes(ln_f_.bias);
+
+    const size_t total_mem = emb_mem + pos_emb_mem + lin_weight_mem + lin_bias_mem + lnorm_mem;
+
+    if (debug) {
+        const size_t total_mem_mb = total_mem / 1000000;
+        const size_t lin_weight_mem_mb = lin_weight_mem / 1000000;
+        const size_t lin_bias_mem_mb = lin_bias_mem / 1000000;
+        const size_t lnorm_mem_mb = lnorm_mem / 1000000;
+
+        std::cout << "--------------------------------------\n";
+        std::cout << "LAYER          | Weight mem usage\n";
+        std::cout << "--------------------------------------\n";
+        std::cout << "Embedding      | " << std::setw(4) << emb_mem_mb        << "MB\n";
+        std::cout << "Pos embedding  | " << std::setw(4) << pos_emb_mem_mb    << "MB\n";
+        std::cout << "Linear [w]     | " << std::setw(4) << lin_weight_mem_mb << "MB\n";
+        std::cout << "Linear [b]     | " << std::setw(4) << lin_bias_mem_mb   << "MB\n";
+        std::cout << "Layer norm     | " << std::setw(4) << lnorm_mem_mb      << "MB\n";
+        std::cout << "--------------------------------------\n";
+        std::cout << "TOTAL          | " << std::setw(4) << total_mem_mb << "MB\n";
+        std::cout << "--------------------------------------\n";
+    }
+
+    return total_mem;
+}
+
 
 static inline void read_block_header(std::ifstream& fin, bool debug = false)
 {
@@ -412,8 +494,9 @@ static inline void read_layer_header(std::ifstream& fin, bool debug = false) {
     layer_name.resize(layer_name_size);
     fin.read(reinterpret_cast<char*>(layer_name.data()), layer_name_size);
 
-    // if (debug)
-    //     std::cout << "Layer: " << layer_name << "\n";
+    if (debug) {
+        std::cout << "Layer: " << layer_name << "\n";
+    }
 }
 
 static inline void read_into_weight(
@@ -425,14 +508,18 @@ static inline void read_into_weight(
     weight_name.resize(weight_name_size);
     fin.read(reinterpret_cast<char*>(weight_name.data()), weight_name_size);
 
-    if (tensor.dtype() == kQint8) {
-        float qscale;
-        int qzerop;
+    if (tensor.dtype() == kQint8)
+    {
+        int32_t deltas_bytes;
+        fin.read(reinterpret_cast<char*>(&deltas_bytes), sizeof(deltas_bytes));
+        const int ndeltas = deltas_bytes / sizeof(Float16);
 
-        fin.read(reinterpret_cast<char*>(&qscale), sizeof(qscale));
-        fin.read(reinterpret_cast<char*>(&qzerop), sizeof(qzerop));
+        Qparams qparams = tensor.qparams();
+        const int expected_deltas = qparams.n_deltas();
+        GTEN_ASSERTM(ndeltas == expected_deltas, "expected %d but got %d deltas.", expected_deltas, ndeltas);
 
-        tensor.set_qparams(qscale, qzerop);
+        Float16* deltas = qparams.deltas();
+        fin.read(reinterpret_cast<char*>(deltas), deltas_bytes); /// deltas size.
     }
 
     int32_t weight_payload_size;
@@ -441,14 +528,14 @@ static inline void read_into_weight(
     // if (debug)
         // std::cout << weight_name << " (" << weight_payload_size << ")\n";
 
-    GTEN_ASSERT(
+    GTEN_ASSERTM(
         static_cast<size_t>(weight_payload_size) == tensor.nbytes(),
         "Weight `%s` data size: %ld does not match the expected size: %d.",
         weight_name.c_str(), tensor.nbytes(), weight_payload_size);
     fin.read(tensor.data_ptr<char>(), weight_payload_size);
 }
 
-void GPT2::load_from_checkpoint(std::ifstream& checkpoint)
+void GPT2::load_from_checkpoint(std::ifstream& checkpoint, Dtype dtype)
 {
     Timer timer{&time_load_ms_};
 

@@ -17,17 +17,6 @@ If you have an Intel CPU that supports AVX and f16c compile with the following
 g++ -std=c++17 -O3 -ffast-math -mavx -mf16c gpt2.cpp -o gpt2
 ./gpt2 -p "Once upon a time"
 
-Multithreading support via OpenMP is also implemented to accelerate linear layers.
- To allow inference with multithreading, compile with:
-
-g++ -std=c++17 -O3 -fopenmp -ffast-math gpt2.cpp -o gpt2
-
-OR
-
-g++ -std=c++17 -O3 -ffast-math -fopenmp -mavx -mf16c gpt2.cpp -o gpt2
-
-for Intel.
-
 Run ./gpt2 --help to see all available options.
 
 ```

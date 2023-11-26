@@ -10,7 +10,8 @@ namespace gten {
 /// Provides an embedding table lookup for tokens.
 class Embedding {
 public:
-    Embedding(int n_vocab, int d_embed, int max_ctx, TensorDtype wdtype);
+    Embedding() = default;
+    Embedding(int n_vocab, int d_embed, int max_ctx, Dtype dtype, int qblock_size = 0);
 
     /// Returns the embeddings of the given tokens. The input tensor must be of shape
     /// (n_ctx,) and the output tensor is of shape (n_ctx, d_embed).
@@ -27,36 +28,35 @@ public:
 
 public:
     Tensor weight;
+    Tensor emb_acv;
 
 private:
-    Tensor emb_acv_;
     bool emb_acv_cached_{false};
     Tensor proj_acv_;
     int max_ctx_;
     int64_t exec_time_emb_ms_{0};
     int64_t exec_time_proj_ms_{0};
-
-private:
-    Tensor forward_impl(const Tensor& inp);
-    Tensor forward_proj_impl(const Tensor& inp);
 };
 
 /// Provides a positional embedding table lookup for tokens.
 class PosEmbedding {
 public:
-    PosEmbedding(int max_ctx, int d_embed, TensorDtype wdtype);
+    PosEmbedding() = default;
+    PosEmbedding(int max_ctx, int d_embed, Dtype dtype, int qblock_size = 0);
 
     /// Return the positional embeddings of the given number of tokens. The number of
     /// tokens must not exceed max_ctx.
     Tensor forward(int n_ctx);
 
     int64_t time() const { return exec_time_ms_; }
+    void reset_acv_cache() { acv_cached_=false; }
 
 public:
     Tensor weight;
+    Tensor acv;
+    bool acv_cached_{false};
 
 private:
-    Tensor acv_;
     int max_ctx_{0};
     int64_t exec_time_ms_{0};
 
@@ -67,7 +67,8 @@ private:
 /// Applies affine normalization on the input.
 class LayerNorm {
 public:
-    LayerNorm(int max_ctx, int d_embed, TensorDtype wdtype);
+    LayerNorm() = default;
+    LayerNorm(int max_ctx, int d_embed, Dtype dtype, int qblock_size = 0);
 
     /// Normalize the input. Both input and output are of shape (n_ctx, n_embed). n_ctx
     /// must not exceed max_ctx.
@@ -79,58 +80,55 @@ public:
 public:
     Tensor weight;
     Tensor bias;
+    Tensor acv;
 
 private:
-    Tensor acv_;
     int max_ctx_;
     bool acv_cached_{false};
     float eps_{1e-05f};
     int64_t exec_time_ms_{0};
-
-private:
-    Tensor forward_impl(const Tensor &inp);
 };
 
 
 class GELU {
 public:
-    GELU(int max_ctx, int d_out);
+    GELU() = default;
+    GELU(int max_ctx, int d_out, Dtype dtype, int qblock_size = 0);
     Tensor forward(const Tensor& inp);
     int64_t time() const noexcept { return exec_time_ms_; }
     void reset_acv_cache() { acv_cached_=false; }
 
+public:
+    Tensor acv;
+
 private:
-    Tensor acv_;
     int max_ctx_;
     bool acv_cached_{false};
     int64_t exec_time_ms_{0};
-
-private:
-    Tensor forward_impl(const Tensor& inp);
 };
 
 class Residual {
 public:
-    Residual(int max_ctx, int d_out);
+    Residual() = default;
+    Residual(int max_ctx, int d_out, Dtype dtype, int qblock_size = 0);
     Tensor forward(const Tensor& inp0, const Tensor& inp1);
     int64_t time() const noexcept { return exec_time_ms_; }
     void reset_acv_cache() { acv_cached_=false; }
 
+public:
+    Tensor acv;
+
 private:
-    Tensor acv_;
     int max_ctx_;
     bool acv_cached_{false};
     int64_t exec_time_ms_{0};
-
-private:
-    Tensor forward_impl(const Tensor& inp0, const Tensor& inp1);
 };
 
 
 /// Applies an affine linear transformation on the input.
 class Linear {
 public:
-    Linear(int d_in, int d_out, int max_ctx, TensorDtype wdtype);
+    Linear(int d_in, int d_out, int max_ctx, Dtype dtype, int qblock_size = 0);
     Tensor forward(const Tensor& inp);
     Tensor forward_transposed(const Tensor& inp);
     int64_t time() const noexcept { return exec_time_ms_; }
@@ -139,21 +137,18 @@ public:
 public:
     Tensor weight;
     Tensor bias;
+    Tensor acv;
 
 private:
-    Tensor acv_;
     bool acv_cached_{false};
     int64_t exec_time_ms_{0};
     int max_ctx_;
-
-private:
-    Tensor forward_impl(const Tensor& inp);
 };
 
 
 class MultiHeadSelfAttn {
 public:
-    MultiHeadSelfAttn(int n_heads, int n_embed, int max_ctx, TensorDtype wdtype);
+    MultiHeadSelfAttn(int n_heads, int n_embed, int max_ctx, Dtype dtype, int qblock_size = 0);
     Tensor forward(const Tensor& inp);
     int64_t time_linear() const noexcept { return query.time() + key.time() + value.time() + qkv_proj.time(); }
     int64_t time_attn() const noexcept { return time_attn_ms_; }
@@ -164,10 +159,10 @@ public:
     Linear key;
     Linear value;
     Linear qkv_proj;
+    Tensor qk_acv;
+    Tensor qkv_acv;
 
 private:
-    Tensor qk_acv_;
-    Tensor qkv_acv_;
     int32_t n_head_;
     int max_ctx_;
     bool qkv_cached_{false};
@@ -180,7 +175,7 @@ private:
 
 class ResidualAttnBlock {
 public:
-    ResidualAttnBlock(int n_attn_heads, int d_embed, int d_mlp, int max_ctx, TensorDtype wdtype);
+    ResidualAttnBlock(int n_attn_heads, int d_embed, int d_mlp, int max_ctx, Dtype dtype, int qblock_size = 0);
     Tensor forward(const Tensor& inp);
     int64_t time_linear() const
     { return attn.time_linear() + mlp_fc.time() + mlp_proj.time(); }
