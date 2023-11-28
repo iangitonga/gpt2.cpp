@@ -4,9 +4,38 @@
 #include "tensor.h"
 #include "simd_ops.h"
 
+#ifdef _OPENMP
+#define GTEN_OMP 1
+#include <omp.h>
+#endif
 
 namespace gten {
 namespace ops {
+
+
+// Stores buffers required by ops.
+class OpsState {
+public:
+    OpsState() {
+        // max bufsize op: gelu 2 x n_embd * 4 == 2 * n_mlp
+        const int max_bufsize = 2 * 4 * 1600;
+        buf_ = new float[max_bufsize];
+        buf_numel_ = max_bufsize;
+    }
+    ~OpsState() { delete[] buf_; }
+
+    // Obtain a ptr to a buffer of size `numel` floats.
+    float* buf(int numel) const {
+        GTEN_ASSERT(numel <= buf_numel_);
+        return buf_;
+    }
+
+private:
+    float* buf_ = nullptr;
+    int buf_numel_ = 0;
+};
+
+static const OpsState g_ops_state = OpsState();
 
 
 static void vec_add_f16(const Float16* a, const Float16* b, Float16* out, int vec_size)
@@ -410,14 +439,16 @@ static void emb_matmul_impl_q8(const Tensor& x, const Tensor& w, Tensor& out)
 
     const int block_size = x_qparams.block_size();
 
+#ifdef GTEN_OMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (int xrow = n_ctx-1; xrow < n_ctx; xrow++) {
-        const Qint8* x_row_data = x_data + xrow * n_embd;
-        const Float16* x_row_deltas = x_qparams.row_deltas(xrow);
-
         for (int wrow = 0; wrow < n_vocab; wrow++) {
+            const Qint8* x_row_data = x_data + xrow * n_embd;
+            const Float16* x_row_deltas = x_qparams.row_deltas(xrow);
             const Qint8* w_row_data = w_data + wrow * n_embd;
-
             const Float16* w_row_deltas = w_qparams.row_deltas(wrow);
+
             const float dot_prod = vec_dot_product_q8(x_row_data, x_row_deltas, w_row_data, w_row_deltas, block_size, n_embd);
             out_data[wrow] = dot_prod;
         }
@@ -434,13 +465,15 @@ static void emb_matmul_impl_f16(const Tensor& x, const Tensor& w, Tensor& out)
     const int n_embd = x.size(1);
     const int n_vocab = w.size(0);
 
+#ifdef GTEN_OMP
     #pragma omp parallel for collapse(2)
+#endif
     for (int xrow = n_ctx-1; xrow < n_ctx; xrow++) {
-        for (int wcol = 0; wcol < n_vocab; wcol++) {
+        for (int wrow = 0; wrow < n_vocab; wrow++) {
             const Float16* x_row_data = x_data + xrow * n_embd;
-            const Float16* w_row_data = w_data + wcol * n_embd;
+            const Float16* w_row_data = w_data + wrow * n_embd;
             float dot_prod = vec_dot_product_f16(x_row_data, w_row_data, n_embd);
-            out_data[wcol] = dot_prod;
+            out_data[wrow] = dot_prod;
         }
     }
 }
@@ -484,36 +517,25 @@ static void affine_proj_2d_impl_q8(const Tensor& x, const Tensor& w, const Tenso
 
     const int block_size = x_qparams.block_size();
 
-    // w: [d_out, n_embd]
-    // s: [dout, n_embd/8]
-
-    // Remove the parallel
-    // use dot prod block
-    // allcate per thread: performance hit.
-    // allocate one large: wasteful: d_out * n_ctx
-
-    float* buf3 = new float[d_out];
+    float* out_buf = g_ops_state.buf(d_out);
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     for (int xrow = ctx_start; xrow < n_ctx; xrow++) {
-        const Qint8* xrow_data = x_data + xrow * x_st0;
-        const Float16* x_row_deltas = x_qparams.row_deltas(xrow);
-
-        for (int wcol = 0; wcol < d_out; wcol++) {
-            const Qint8* wrow_data = w_data + wcol * w_st0;
-            const Float16* w_row_deltas = w_qparams.row_deltas(wcol);
+        for (int wrow = 0; wrow < d_out; wrow++) {
+            const Qint8* xrow_data = x_data + xrow * x_st0;
+            const Float16* x_row_deltas = x_qparams.row_deltas(xrow);
+            const Qint8* wrow_data = w_data + wrow * w_st0;
+            const Float16* w_row_deltas = w_qparams.row_deltas(wrow);
 
             const float dot_prod = vec_dot_product_q8(xrow_data, x_row_deltas, wrow_data, w_row_deltas, block_size, n_embd);
-            float bias_scalar = fp16_to_fp32(bias_data[wcol]);
+            float bias_scalar = fp16_to_fp32(bias_data[wrow]);
 
-            buf3[wcol] = dot_prod + bias_scalar;
+            out_buf[wrow] = dot_prod + bias_scalar;
         }
 
         Qint8* outrow_data = out_data + xrow * out_st0;
-        quantize_row(xrow, buf3, out_qparams, outrow_data);
+        quantize_row(xrow, out_buf, out_qparams, outrow_data);
     }
-
-    delete[] buf3;
 }
 
 static void affine_proj_2d_impl_f16(const Tensor& x, const Tensor& w, const Tensor& bias, Tensor& out, const bool last_ctx_only)
@@ -532,13 +554,16 @@ static void affine_proj_2d_impl_f16(const Tensor& x, const Tensor& w, const Tens
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
 
+#ifdef GTEN_OMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (int xrow = ctx_start; xrow < n_ctx; xrow++) {
-        for (int wcol = 0; wcol < d_out; wcol++) {
+        for (int wrow = 0; wrow < d_out; wrow++) {
             const Float16* xrow_data = x_data + xrow * x_st0;
-            const Float16* wrow_data = w_data + wcol * w_st0;
+            const Float16* wrow_data = w_data + wrow * w_st0;
             float dot_prod = vec_dot_product_f16(xrow_data, wrow_data, n_embd);
-            float bias_scalar = fp16_to_fp32(bias_data[wcol]);
-            out_data[xrow * out_st0 + wcol] = fp32_to_fp16(dot_prod + bias_scalar);
+            float bias_scalar = fp16_to_fp32(bias_data[wrow]);
+            out_data[xrow * out_st0 + wrow] = fp32_to_fp16(dot_prod + bias_scalar);
         }
     }
 }
@@ -584,14 +609,16 @@ void affine_proj_2d_transposed_impl_f16(const Tensor& x, const Tensor& w, const 
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
 
+#ifdef GTEN_OMP
     #pragma omp parallel for collapse(2)
+#endif
     for (int xrow = ctx_start; xrow < n_ctx; xrow++) {
-        for (int wcol = 0; wcol < n_embd; wcol++) {
+        for (int wrow = 0; wrow < n_embd; wrow++) {
             const Float16* x_row_data = x_data + xrow * x_st0;
-            const Float16* w_row_data = w_data + wcol * w_st0;
+            const Float16* w_row_data = w_data + wrow * w_st0;
             const float dot_prod = vec_dot_product_f16(x_row_data, w_row_data, n_embd);
-            const float bias_scalar = fp16_to_fp32(bias_data[wcol]);
-            out_data[wcol * out_st0 + xrow] = fp32_to_fp16(dot_prod + bias_scalar);
+            const float bias_scalar = fp16_to_fp32(bias_data[wrow]);
+            out_data[wrow * out_st0 + xrow] = fp32_to_fp16(dot_prod + bias_scalar);
         }
     }
 }
@@ -613,48 +640,41 @@ void affine_proj_2d_transposed_impl_q8(const Tensor& x, const Tensor& w, const T
     const Qparams& x_qparams = x.qparams();
     const Qparams& w_qparams = w.qparams();
 
-    float* buf1 = new float[n_embd];
-    float* buf2 = new float[n_embd];
-    float* buf3 = new float[n_embd];
-
-    // quantize columns
-    // dequantize transposed.
     const int block_size = out.qparams().block_size();
     const int n_blocks = n_embd / block_size;
+
+    float* out_buf = g_ops_state.buf(n_embd);
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     
     for (int xrow = ctx_start; xrow < n_ctx; xrow++) {
         const Qint8* x_row_data = x_data + xrow * x_st0;
-        dequantize_row(xrow, x_row_data, x_qparams, buf1);
+        const Float16* x_ds = x_qparams.row_deltas(xrow);
 
-        for (int wcol = 0; wcol < n_embd; wcol++) {
-            const Qint8* w_row_data = w_data + wcol * w_st0;
-            dequantize_row(wcol, w_row_data, w_qparams, buf2);
+        for (int wrow = 0; wrow < n_embd; wrow++) {
+            const Qint8* w_row_data = w_data + wrow * w_st0;
+            const Float16* w_ds = w_qparams.row_deltas(wrow);
 
-            const float dot_prod = vec_dot_product_f32(buf1, buf2, n_embd);
-            const float bias_scalar = fp16_to_fp32(bias_data[wcol]);
-            buf3[wcol] = dot_prod + bias_scalar;
+            const float dot_prod = vec_dot_product_q8(x_row_data, x_ds, w_row_data, w_ds, block_size, n_embd);
+            const float bias_scalar = fp16_to_fp32(bias_data[wrow]);
+            
+            out_buf[wrow] = dot_prod + bias_scalar;
         }
 
         Float16* out_row_deltas = out.qparams().row_deltas(xrow);
 
         // Quantize the row but store it as a column (i.e transposed). 
         for (int i = 0; i < n_blocks; i++) {
-            const float delta = compute_quantization_delta(buf3 + i * block_size, block_size);
+            const float delta = compute_quantization_delta(out_buf + i * block_size, block_size);
 
             out_row_deltas[i] = fp32_to_fp16(delta);
 
             for (int j = 0; j < block_size; j++) {
-                const int wcol = i * block_size + j;
-                out_data[wcol * out_st0 + xrow] = quantize(buf3[i * block_size + j], delta);
+                const int wrow = i * block_size + j;
+                out_data[wrow * out_st0 + xrow] = quantize(out_buf[i * block_size + j], delta);
             }
         }
     }
-
-    delete[] buf1;
-    delete[] buf2;
-    delete[] buf3;
 }
 
 
@@ -682,45 +702,6 @@ void affine_proj_2d_transposed(const Tensor& x, const Tensor& w, const Tensor& b
     }
 }
 
-/*
-
-simd_add(fp32* a8, fp32* b8, fp32 out8)
-
-add(qint a, qint b, qint out)
-    nrows
-    ncols
-
-    buf0, buf1, buf2;
-    for row in nrows:
-        for block in nblocks:
-            buf0 = dequantize_block(a_block, a_qparams)
-            buf1 = dequantize_block(b_block, a_qparams)
-            for i in block_size += GTEN_SIMD
-                buf2 = simd_add(buf0, buf1)
-            delta = quantize_block(buf2, out_block)
-            out.qparams[row][block] = delta
-
--> Disrupts the algorithms
--> weight and acv must have same blocks?
--> makes block quantization explicit
--> uses less memory. largest block = block_size*4*3=>384 bytes
-
-add(qint a, qint b, qint out)
-    nrows
-    ncols
-
-    buf0, buf1, buf2;
-    for row in nrows:
-        buf0 = dequantize_row(a_block, a_qparams)
-        buf1 = dequantize_row(b_block, a_qparams)
-        for i in block_size += GTEN_SIMD
-            buf2 = simd_add(buf0, buf1)
-        delta = quantize_row(buf2, out_block, out_qparams) 
-        out.qparams[row][block] = delta
-
--> uses more memory. largest row [4*n_embed] = 4*1600*4*3=>77000 bytes
-*/
-
 static void add_impl_q8(const Tensor& x0, const Tensor& x1, Tensor& out, const bool last_ctx_only)
 {
     const Qint8* x0_data = x0.data_ptr<Qint8>();
@@ -733,9 +714,13 @@ static void add_impl_q8(const Tensor& x0, const Tensor& x1, Tensor& out, const b
 
     Qparams& out_qparams = out.qparams();
 
-    float* buf1 = new float[n_embd];
-    float* buf2 = new float[n_embd];
-    float* buf3 = new float[n_embd];
+    float* buf = g_ops_state.buf(n_embd * 3);
+    float* x0_buf = buf;
+    float* x1_buf = buf + n_embd;
+    float* out_buf = buf + n_embd + n_embd;
+
+    // auto [x0_buf, x1_buf, x2_buf] = g_ops_state.buf(n_embd, n_embd, n_embd)
+    // Fewer lines of code. Just as efficient. no ptr arithmetic.
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     for (int i = ctx_start; i < n_ctx; i++)
@@ -743,18 +728,14 @@ static void add_impl_q8(const Tensor& x0, const Tensor& x1, Tensor& out, const b
         const Qint8* x0_row_data = x0_data + i * st0;
         const Qint8* x1_row_data = x1_data + i * st0;
 
-        dequantize_row(i, x0_row_data, x0.qparams(), buf1);
-        dequantize_row(i, x1_row_data, x1.qparams(), buf2);
+        dequantize_row(i, x0_row_data, x0.qparams(), x0_buf);
+        dequantize_row(i, x1_row_data, x1.qparams(), x1_buf);
 
-        vec_add_f32(buf1, buf2, buf3, n_embd);
+        vec_add_f32(x0_buf, x1_buf, out_buf, n_embd);
 
         Qint8* out_row_data = out_data + i * st0;
-        quantize_row(i, buf3, out_qparams, out_row_data);
+        quantize_row(i, out_buf, out_qparams, out_row_data);
     }
-
-    delete[] buf1;
-    delete[] buf2;
-    delete[] buf3;
 }
 
 static void add_impl_f16(const Tensor& x0, const Tensor& x1, Tensor& out, const bool last_ctx_only)
@@ -797,7 +778,7 @@ void gelu_impl_q8(const Tensor& inp, Tensor& out, const bool last_ctx_only)
 {
     // TODO: Replace with lookup table.
     const int n_ctx = out.size(0);
-    const int n_embd = out.size(1);
+    const int d_in = out.size(1);
     
     const Qint8* inp_data = inp.data_ptr<Qint8>();
     Qint8* out_data = out.data_ptr<Qint8>();
@@ -805,28 +786,26 @@ void gelu_impl_q8(const Tensor& inp, Tensor& out, const bool last_ctx_only)
     const Qparams& inp_qparams = inp.qparams();
     Qparams& out_qparams = out.qparams();
 
-    float* buf1 = new float[n_embd];
-    float* buf2 = new float[n_embd];
+    float* buf = g_ops_state.buf(2 * d_in);
+    float* inp_buf = buf;
+    float* out_buf = buf + d_in;
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     for (int i = ctx_start; i < n_ctx; ++i) {
-        const Qint8* inp_row_data = inp_data + i * n_embd;
-        dequantize_row(i, inp_row_data, inp_qparams, buf1);
+        const Qint8* inp_row_data = inp_data + i * d_in;
+        dequantize_row(i, inp_row_data, inp_qparams, inp_buf);
 
-        for (int j = 0; j < n_embd; j++) {
-            float x = buf1[j];
+        for (int j = 0; j < d_in; j++) {
+            float x = inp_buf[j];
             float res = 0.5 * x 
                         * (1.0f + std::tanh(std::sqrt(2.0f / 3.141592653589793f)
                         * (x + 0.044715f * std::pow(x, 3.0f))));
-            buf2[j] = res;
+            out_buf[j] = res;
         }
 
-        Qint8* out_row_data = out_data + i * n_embd;
-        quantize_row(i, buf2, out_qparams, out_row_data);
+        Qint8* out_row_data = out_data + i * d_in;
+        quantize_row(i, out_buf, out_qparams, out_row_data);
     }
-
-    delete[] buf1;
-    delete[] buf2;
 }
 
 
@@ -882,23 +861,21 @@ static void layer_norm_impl_q8(const Tensor& x, const Tensor& w, const Tensor& b
     const Qparams& w_qparams = w.qparams();
     Qparams& out_qparams = out.qparams();
 
-    float* buf1 = new float[n_embd];
-    float* buf2 = new float[n_embd];
+    float* buf = g_ops_state.buf(2 * n_embd);
+    float* inp_buf = buf;
+    float* out_buf = buf + n_embd;
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     for (int xrow = ctx_start; xrow < n_ctx; xrow++) {
         const Qint8* inp_row_data = x_data + xrow * st0;
         Qint8* out_row_data = out_data + xrow * st0;
 
-        dequantize_row(xrow, inp_row_data, x_qparams, buf1);
+        dequantize_row(xrow, inp_row_data, x_qparams, inp_buf);
 
-        vec_layer_norm_f32(buf1, n_embd, w_data, bias_data, buf2);
+        vec_layer_norm_f32(inp_buf, n_embd, w_data, bias_data, out_buf);
 
-        quantize_row(xrow, buf2, out_qparams, out_data + xrow * n_embd);
+        quantize_row(xrow, out_buf, out_qparams, out_data + xrow * n_embd);
     }
-
-    delete[] buf1;
-    delete[] buf2;
 }
 
 static void layer_norm_impl_f16(const Tensor& x, const Tensor& w, const Tensor& bias, Tensor& out, bool last_ctx_only)
@@ -1006,8 +983,7 @@ void qk_masked_softmax_f16(const Tensor& q, const Tensor& k, Tensor& qk_out, flo
     const int qkst0 = qk_out.stride(0);
     const int qkst1 = qk_out.stride(1);
 
-    const int max_ctx = 1024;
-    float out_buf[max_ctx];
+    float* out_buf = g_ops_state.buf(n_ctx);
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
 
@@ -1090,8 +1066,7 @@ void qk_masked_softmax_q8(const Tensor& q, const Tensor& k, Tensor& qk_out, floa
     const Qparams& k_params = k.qparams();
     const int block_size = k_params.block_size();
 
-    float* buf1 = new float[nhead * d_head];
-    float* out_buf = new float[n_ctx];
+    float* out_buf = g_ops_state.buf(n_ctx);
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
 
@@ -1215,40 +1190,36 @@ void qkv_matmul_q8(const Tensor& qk, const Tensor& v, Tensor& qkv_out, const boo
     // out: [c, h, d] nhead, dhead
     // qkv_st1: dhead
     // v: n_head, d_head, n_ctx
-    const uint32_t b = -1;
 
     Qparams& qkv_out_qparams = qkv_out.qparams();
     const Qparams& v_qparams = v.qparams();
 
-    float* buf1 = new float[n_ctx];
-    float* buf2 = new float[n_ctx];
-    float* buf3 = new float[nhead * dhead];
+    float* buf = g_ops_state.buf(n_ctx + n_ctx + nhead * dhead);
+    float* qk_buf = buf;
+    float* v_buf = buf + n_ctx;
+    float* out_buf = buf + n_ctx + nhead * dhead;
 
     const int ctx_start = last_ctx_only ? n_ctx - 1 : 0;
     for (int qkr = ctx_start; qkr < n_ctx; qkr++) {
         for (int h = 0; h < nhead; h++) {
             const Qint8* qkr_data = qk_data + (h * qkst0 + qkr * qkst1);  // qk_row_data
             
-            dequantize_row_scale(qkr_data, delta, buf2, n_ctx);
+            dequantize_row_scale(qkr_data, delta, qk_buf, n_ctx);
 
             for (int vc = 0; vc < dhead; vc++) {
                 const Qint8* vc_data = v_data + (h * vst0 + vc * vst1);
 
                 const int col_idx = h * dhead + vc;
-                dequantize_col(col_idx, vc_data, v_qparams, buf1, n_ctx);
+                dequantize_col(col_idx, vc_data, v_qparams, v_buf, n_ctx);
 
-                 const float dot_prod = vec_dot_product_f32(buf1, buf2, n_ctx);
-                buf3[h * qkv_st1 + vc] = dot_prod;
+                 const float dot_prod = vec_dot_product_f32(qk_buf, v_buf, n_ctx);
+                out_buf[h * qkv_st1 + vc] = dot_prod;
             }
         }
 
         Qint8* out_row_data = out_data + qkr * qkv_st0;
-        quantize_row(qkr, buf3, qkv_out_qparams, out_row_data);
+        quantize_row(qkr, out_buf, qkv_out_qparams, out_row_data);
     }
-
-    delete[] buf1;
-    delete[] buf2;
-    delete[] buf3;
 }
 
 

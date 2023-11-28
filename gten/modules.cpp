@@ -74,10 +74,9 @@ Tensor PosEmbedding::forward_impl(int n_ctx)
 
         for (int i = ctx_start; i < n_ctx; i++) {
             for (int j = 0; j < blocks_per_row; j++) {
-                for (int k = 0; k < block_size; k++) {
-                    const Qint8 val = weight_data[i * n_embd + j * block_size + k];
-                    out_data[i * n_embd + j * block_size + k] = val;
-                }  
+                const Qint8* src = weight_data + i * n_embd + j * block_size;
+                Qint8* dest = out_data + i * n_embd + j * block_size;
+                std::memcpy(dest, src, block_size * sizeof(Qint8));
 
                 Float16* out_row_deltas = out_qparams.row_deltas(i);
                 out_row_deltas[j] = w_qparams.row_deltas(i)[j];
